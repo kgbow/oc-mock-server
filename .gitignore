@@ -9,3 +9,4 @@ web/dist
 *.sqlite-shm
 .DS_Store
 .env
+*.tsbuildinfo

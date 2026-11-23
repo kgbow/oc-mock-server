@@ -1,0 +1,330 @@
+import { useMemo, useState } from 'react'
+import { Layers, Send, Sparkles, X } from 'lucide-react'
+import { api } from '../api'
+import type { OpenApiSummary, SseRecord } from '../types'
+
+interface FoldedGroup {
+  kind: 'folded'
+  from_seq: number
+  to_seq: number
+  count: number
+  session_id: string | null
+  part_id: string
+  preview: string
+  directory: string
+  source: SseRecord['source']
+  records: SseRecord[]
+}
+
+type DisplayRow = { kind: 'single'; record: SseRecord } | FoldedGroup
+
+function foldClientSide(records: SseRecord[]): DisplayRow[] {
+  // Input is newest-first; fold chronologically then reverse for display
+  const chrono = [...records].reverse()
+  const out: DisplayRow[] = []
+  let acc: FoldedGroup | null = null
+
+  const flush = () => {
+    if (acc) {
+      out.push(acc)
+      acc = null
+    }
+  }
+
+  for (const r of chrono) {
+    if (r.event_type === 'message.part.delta') {
+      const props = (r.payload as { properties?: { partID?: string; delta?: string } })?.properties
+      const pid = props?.partID ?? r.part_id ?? ''
+      const delta = props?.delta ?? ''
+      if (acc && acc.part_id === pid && acc.session_id === r.session_id) {
+        acc.to_seq = r.seq
+        acc.count += 1
+        acc.preview = (acc.preview + delta).slice(0, 140)
+        acc.records.push(r)
+      } else {
+        flush()
+        acc = {
+          kind: 'folded',
+          from_seq: r.seq,
+          to_seq: r.seq,
+          count: 1,
+          session_id: r.session_id,
+          part_id: pid,
+          preview: delta.slice(0, 140),
+          directory: r.directory,
+          source: r.source,
+          records: [r],
+        }
+      }
+    } else {
+      flush()
+      out.push({ kind: 'single', record: r })
+    }
+  }
+  flush()
+  return out.reverse()
+}
+
+export function SseView(props: {
+  events: SseRecord[]
+  openapi: OpenApiSummary | null
+  activeDirectories: string[]
+  onNotify: (msg: string, isErr?: boolean) => void
+}) {
+  const [filterText, setFilterText] = useState('')
+  const [foldDeltas, setFoldDeltas] = useState(true)
+  const [selected, setSelected] = useState<DisplayRow | null>(null)
+  const [showInjector, setShowInjector] = useState(false)
+  const [injectType, setInjectType] = useState('permission.asked')
+  const [injectDir, setInjectDir] = useState('')
+  const [applyShadow, setApplyShadow] = useState(true)
+  const [injectJson, setInjectJson] = useState(
+    JSON.stringify(
+      {
+        type: 'permission.asked',
+        properties: {
+          id: 'perm_mock_001',
+          sessionID: 'ses_demo_replay_001',
+          permission: 'bash',
+          patterns: ['cargo test --workspace'],
+          metadata: { command: 'cargo test --workspace' },
+          always: ['cargo test*'],
+        },
+      },
+      null,
+      2,
+    ),
+  )
+
+  const filtered = useMemo(() => {
+    const q = filterText.trim().toLowerCase()
+    const base = props.events.filter((e) => {
+      if (!q) return true
+      return (
+        e.event_type.toLowerCase().includes(q) ||
+        (e.session_id ?? '').toLowerCase().includes(q) ||
+        e.directory.toLowerCase().includes(q) ||
+        JSON.stringify(e.payload).toLowerCase().includes(q)
+      )
+    })
+    return foldDeltas ? foldClientSide(base) : base.map((record): DisplayRow => ({ kind: 'single', record }))
+  }, [props.events, filterText, foldDeltas])
+
+  const generateTemplate = async (evType: string) => {
+    setInjectType(evType)
+    try {
+      const data = await api.fakeSse(evType, injectDir || props.activeDirectories[0])
+      setInjectJson(JSON.stringify(data, null, 2))
+    } catch (e) {
+      props.onNotify(String(e), true)
+    }
+  }
+
+  const sendInject = async () => {
+    let payload: unknown
+    try {
+      payload = JSON.parse(injectJson)
+    } catch {
+      props.onNotify('Inject payload is not valid JSON', true)
+      return
+    }
+    try {
+      await api.injectSse({
+        directory: injectDir || props.activeDirectories[0],
+        payload,
+        apply_to_shadow: applyShadow,
+      })
+      props.onNotify('Injected SSE event to connected clients')
+    } catch (e) {
+      props.onNotify(String(e), true)
+    }
+  }
+
+  return (
+    <>
+      <div className="toolbar">
+        <div className="toolbar-group">
+          <input
+            className="input"
+            style={{ width: 280 }}
+            placeholder="Filter event type, session, payload..."
+            value={filterText}
+            onChange={(e) => setFilterText(e.target.value)}
+          />
+          <button
+            className={`btn btn-sm ${foldDeltas ? 'btn-primary' : ''}`}
+            onClick={() => setFoldDeltas((v) => !v)}
+          >
+            <Layers size={12} /> {foldDeltas ? 'Deltas Folded' : 'Raw Frames'}
+          </button>
+        </div>
+        <div className="toolbar-group">
+          <span className="mono" style={{ color: 'var(--text-muted)', fontSize: 11.5 }}>
+            {filtered.length} rows ({props.events.length} raw frames)
+          </span>
+          <button
+            className={`btn btn-sm ${showInjector ? 'btn-primary' : ''}`}
+            onClick={() => setShowInjector((v) => !v)}
+          >
+            <Send size={12} /> Inject Event
+          </button>
+        </div>
+      </div>
+
+      {showInjector && (
+        <div style={{ padding: '10px 14px', borderBottom: '1px solid var(--border-subtle)', background: 'var(--bg-surface)' }}>
+          <div className="toolbar-group" style={{ marginBottom: 8 }}>
+            <select
+              className="select"
+              value={injectType}
+              onChange={(e) => generateTemplate(e.target.value)}
+            >
+              {(props.openapi?.events ?? []).map((ev) => (
+                <option key={ev.event_type} value={ev.event_type}>
+                  {ev.event_type}
+                </option>
+              ))}
+            </select>
+            <button className="btn btn-sm" onClick={() => generateTemplate(injectType)}>
+              <Sparkles size={12} /> Fake from OpenAPI
+            </button>
+            <input
+              className="input"
+              style={{ width: 220 }}
+              placeholder={props.activeDirectories[0] ?? '/workspace/project'}
+              value={injectDir}
+              onChange={(e) => setInjectDir(e.target.value)}
+            />
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12, color: 'var(--text-secondary)' }}>
+              <input type="checkbox" checked={applyShadow} onChange={(e) => setApplyShadow(e.target.checked)} />
+              Update ShadowStore
+            </label>
+            <button className="btn btn-sm btn-primary" onClick={sendInject}>
+              <Send size={12} /> Emit to Clients
+            </button>
+          </div>
+          <textarea
+            className="textarea"
+            rows={7}
+            value={injectJson}
+            onChange={(e) => setInjectJson(e.target.value)}
+          />
+        </div>
+      )}
+
+      <div className="split-pane">
+        <div className="pane-left">
+          {filtered.length === 0 ? (
+            <div className="empty-state">
+              No SSE events captured yet. Connect an upstream OpenCode server, inject an event, or play a Session Tape.
+            </div>
+          ) : (
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Seq</th>
+                  <th>Source</th>
+                  <th>Event Type</th>
+                  <th>Session</th>
+                  <th>Directory</th>
+                  <th>Preview</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((row) => {
+                  const key = row.kind === 'single' ? `s-${row.record.seq}` : `f-${row.from_seq}-${row.to_seq}`
+                  const isSel =
+                    selected &&
+                    ((row.kind === 'single' && selected.kind === 'single' && row.record.seq === selected.record.seq) ||
+                      (row.kind === 'folded' && selected.kind === 'folded' && row.from_seq === selected.from_seq))
+
+                  if (row.kind === 'folded') {
+                    return (
+                      <tr key={key} className={isSel ? 'selected' : ''} onClick={() => setSelected(row)}>
+                        <td className="mono" style={{ color: 'var(--text-muted)' }}>
+                          #{row.from_seq}..{row.to_seq}
+                        </td>
+                        <td>
+                          <span className="badge badge-info">{row.source}</span>
+                        </td>
+                        <td>
+                          <span className="badge badge-ok">delta × {row.count}</span>
+                        </td>
+                        <td className="mono">{row.session_id ?? '—'}</td>
+                        <td className="mono" style={{ color: 'var(--text-muted)' }}>
+                          {row.directory}
+                        </td>
+                        <td className="mono" style={{ color: 'var(--text-secondary)' }}>
+                          {row.preview}
+                        </td>
+                      </tr>
+                    )
+                  }
+
+                  const r = row.record
+                  const srcBadge =
+                    r.source === 'replay' ? 'badge-warn' : r.source === 'injected' ? 'badge-info' : 'badge-neutral'
+                  return (
+                    <tr key={key} className={isSel ? 'selected' : ''} onClick={() => setSelected(row)}>
+                      <td className="mono" style={{ color: 'var(--text-muted)' }}>
+                        #{r.seq}
+                      </td>
+                      <td>
+                        <span className={`badge ${srcBadge}`}>{r.source}</span>
+                      </td>
+                      <td className="mono" style={{ fontWeight: 500, color: 'var(--accent-strong)' }}>
+                        {r.event_type}
+                      </td>
+                      <td className="mono">{r.session_id ?? '—'}</td>
+                      <td className="mono" style={{ color: 'var(--text-muted)' }}>
+                        {r.directory}
+                      </td>
+                      <td className="mono" style={{ color: 'var(--text-secondary)' }}>
+                        {JSON.stringify(r.payload).slice(0, 120)}
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {selected && (
+          <aside className="pane-right">
+            <div className="inspector-header">
+              <span className="mono" style={{ fontWeight: 600 }}>
+                {selected.kind === 'single'
+                  ? `#${selected.record.seq} ${selected.record.event_type}`
+                  : `#${selected.from_seq}..#${selected.to_seq} Folded Deltas (${selected.count} frames)`}
+              </span>
+              <button className="btn btn-sm btn-ghost" onClick={() => setSelected(null)}>
+                <X size={14} />
+              </button>
+            </div>
+            <div className="inspector-body">
+              {selected.kind === 'single' ? (
+                <pre className="code-block">{JSON.stringify(selected.record.payload, null, 2)}</pre>
+              ) : (
+                <>
+                  <div className="panel" style={{ padding: 10 }}>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>
+                      Concatenated delta text ({selected.records.length} frames, part {selected.part_id})
+                    </div>
+                    <pre className="code-block">
+                      {selected.records
+                        .map((r) => (r.payload as { properties?: { delta?: string } })?.properties?.delta ?? '')
+                        .join('')}
+                    </pre>
+                  </div>
+                  <div className="panel-title">Raw Frames</div>
+                  <pre className="code-block">{JSON.stringify(selected.records, null, 2)}</pre>
+                </>
+              )}
+            </div>
+          </aside>
+        )}
+      </div>
+    </>
+  )
+}
