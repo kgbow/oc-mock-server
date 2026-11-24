@@ -14,13 +14,15 @@ A single Rust process binds two separate ports to eliminate route, CORS, and rec
 
 1. **Proxy Plane (default `127.0.0.1:4097`)** — Presents an OpenCode-compatible server surface to clients:
    - **HTTP Reverse Proxy**: Streaming request/response passthrough with two-phase trace reporting (`Pending` -> `Completed`), CORS/Basic Auth forwarding, full body tee capture, and `directory` / `workspace` / `sessionID` semantic extraction.
-   - **Mock, Patch & Breakpoint Engine**: Evaluates priority-ordered rules matching `method`, `path_pattern` (supporting `:param` and `*`), and optional `directory_filter`:
-     - `direct`: Immediate local response with optional artificial latency (`delay_ms`).
-     - `patch`: Forward to upstream, then merge/patch JSON response before returning.
-     - `breakpoint`: Suspend in-flight request on a `tokio::sync::oneshot` channel; Web DevTools inspects/edits status, headers, or body and clicks Resume / Mock.
-   - **Decoupled SSE Hub**:
+   - **Mock, Patch, SSE Stream & Dynamic Breakpoint Engine**: Evaluates priority-ordered rules matching `method`, `path_pattern` (`:param`, `*`, `regex:`), `query_pattern`, `body_contains`, and `directory_filter` (active in `Intercept` and `Replay` modes; bypassed cleanly in `Passthrough` mode):
+     - `direct`: Immediate local response with optional artificial latency (`delay_ms`), `{{session_id}}` / `{{directory}}` template substitution, and optional **HTTP-triggered SSE Hub sequences** (`sse_sequence`).
+     - `patch`: Forward to upstream, then merge/patch JSON response (and optionally trigger synthetic SSE sequences).
+     - `sse_stream`: Stream standard `Content-Type: text/event-stream` chunked responses directly over HTTP.
+     - `breakpoint`: Suspend in-flight HTTP **requests**, real upstream HTTP **responses**, or live **SSE event frames** on a `tokio::sync::oneshot` channel (with optional `one_shot` auto-disable); Web DevTools inspects/edits status, headers, or JSON payload and resumes, mocks, or drops.
+   - **Decoupled SSE Hub & Live SSE Rule Engine (`SseMockRule`)**:
      - Compatible with both `GET /global/event` (`{ directory, payload }`) and `GET /event` (`payload` filtered by `directory`).
-     - Decouples upstream ingestion from downstream fan-out so operators can switch between `passthrough`, `intercept` (mute upstream / filter), and `replay` modes on the fly.
+     - Evaluates dynamic SSE rules (`event_type_pattern`, `session_filter`, `directory_filter`, `payload_contains`) supporting `drop`, `patch` (JSON Merge Patch), `replace`, `delay`, and live `breakpoint` suspension.
+     - Decouples upstream ingestion from downstream fan-out so operators can switch between `passthrough` (bypass all rules), `intercept` (evaluate all active HTTP & SSE rules/breakpoints), and `replay` modes on the fly.
      - Injects an **independent `server.heartbeat` every 9 seconds** per client connection to prevent OpenCode's 15-second client heartbeat timeout from disconnecting and triggering a full bootstrap reload during pause/step debugging.
    - **PTY WebSocket Bridge**: Transparent bidirectional bridge for `GET /pty/:ptyID/connect`.
    - **Shadow Store Virtual Endpoints**: During Replay or Offline mode, intercepts/merges `GET /session`, `GET /session/:id`, `GET /session/:id/message`, `GET /session/status`, `GET /session/:id/todo`, `GET /session/:id/diff`, `GET /permission`, `GET /question`, and offline bootstrap routes (`/global/health`, `/path`, `/project`, `/project/current`, `/config`, `/global/config`, `/provider`, `/agent`, `/command`, `/vcs`, `/mcp`, `/lsp`, `/formatter`).

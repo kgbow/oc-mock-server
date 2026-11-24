@@ -247,6 +247,128 @@ fn path_matching_rules_work() {
     assert!(!path_matches("/session/:sessionID/message", "/session/ses_abc/todo"));
     assert!(path_matches("/session/*", "/session/ses_abc/message"));
     assert!(path_matches("*", "/anything/here"));
+    assert!(path_matches(
+        "regex:^/session/ses_[0-9]+/(message|todo)$",
+        "/session/ses_42/todo"
+    ));
+    assert!(!path_matches(
+        "regex:^/session/ses_[0-9]+/(message|todo)$",
+        "/session/ses_abc/todo"
+    ));
+    assert!(pattern_matches("message.part.*", "message.part.delta"));
+    assert!(substring_or_regex_matches(r#"regex:"tool"\s*:\s*"bash""#, r#"{"tool": "bash"}"#));
+}
+
+#[test]
+fn dynamic_http_and_sse_rules_with_one_shot_and_dropped_frames() {
+    let store = Storage::open_in_memory().unwrap();
+    let http_rule = MockRule {
+        id: "rule_dyn_1".into(),
+        name: "Dynamic Body & Query Match".into(),
+        enabled: true,
+        priority: 10,
+        method: "POST".into(),
+        path_pattern: "/session/:id/message".into(),
+        query_pattern: Some("directory=*demo*".into()),
+        body_contains: Some("trigger-mock".into()),
+        directory_filter: None,
+        action_type: MockActionType::Direct,
+        breakpoint_phase: BreakpointPhase::Request,
+        one_shot: true,
+        hit_count: 0,
+        status: 200,
+        delay_ms: 0,
+        headers: BTreeMap::new(),
+        body: Some(json!({"ok": true})),
+        patch: None,
+        sse_sequence: Vec::new(),
+        created_at: now_ms(),
+    };
+    store.upsert_mock_rule(&http_rule).unwrap();
+    assert!(store
+        .has_body_dependent_rule("POST", "/session/ses_1/message", Some("directory=/tmp/demo"), None)
+        .unwrap());
+    assert!(store
+        .find_matching_rule_ext(
+            "POST",
+            "/session/ses_1/message",
+            Some("directory=/tmp/demo"),
+            None,
+            Some("normal prompt"),
+        )
+        .unwrap()
+        .is_none());
+    let matched = store
+        .find_matching_rule_ext(
+            "POST",
+            "/session/ses_1/message",
+            Some("directory=/tmp/demo"),
+            None,
+            Some("please trigger-mock now"),
+        )
+        .unwrap()
+        .expect("dynamic rule must match");
+    assert_eq!(matched.id, "rule_dyn_1");
+
+    // One-shot disables after 1 hit
+    store.record_mock_rule_hit(&matched.id, matched.one_shot).unwrap();
+    assert!(store
+        .find_matching_rule_ext(
+            "POST",
+            "/session/ses_1/message",
+            Some("directory=/tmp/demo"),
+            None,
+            Some("please trigger-mock now"),
+        )
+        .unwrap()
+        .is_none());
+
+    // SSE rule matching & dropped event exclusion from ShadowStore reconstruction
+    let sse_rule = SseMockRule {
+        id: "sserule_1".into(),
+        name: "Drop bash perm".into(),
+        enabled: true,
+        priority: 10,
+        event_type_pattern: "permission.*".into(),
+        session_filter: Some("ses_1".into()),
+        directory_filter: None,
+        payload_contains: Some("rm -rf".into()),
+        action_type: SseMockActionType::Drop,
+        delay_ms: 0,
+        patch: None,
+        replace_events: Vec::new(),
+        one_shot: false,
+        hit_count: 0,
+        created_at: now_ms(),
+    };
+    store.upsert_sse_mock_rule(&sse_rule).unwrap();
+    assert!(store
+        .find_matching_sse_rule(
+            "permission.asked",
+            Some("ses_1"),
+            "/tmp/demo",
+            r#"{"type":"permission.asked","cmd":"rm -rf"}"#,
+        )
+        .unwrap()
+        .is_some());
+
+    // Dropped SSE frame is stored for DevTools visibility but ignored by ShadowStore state reconstruction
+    store
+        .insert_sse_event_with_meta(
+            now_ms(),
+            SseSource::Upstream,
+            "/tmp/demo",
+            &json!({
+                "type": "todo.updated",
+                "properties": { "sessionID": "ses_1", "todos": [{ "id": "t1", "content": "should be dropped" }] }
+            }),
+            true,
+            Some("sserule_1".into()),
+            true,
+        )
+        .unwrap();
+    let state = store.reconstruct_session_state("ses_1", None).unwrap();
+    assert!(state.todos_for("ses_1").is_empty());
 }
 
 #[test]
@@ -262,6 +384,9 @@ fn fold_events_keeps_non_deltas_intact() {
             message_id: None,
             part_id: None,
             payload: json!({"type":"session.status","properties":{"sessionID":"s1","status":{"type":"busy"}}}),
+            mocked: false,
+            mock_rule_id: None,
+            dropped: false,
         },
         SseRecord {
             seq: 2,
@@ -273,6 +398,9 @@ fn fold_events_keeps_non_deltas_intact() {
             message_id: Some("m1".into()),
             part_id: Some("p1".into()),
             payload: json!({"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"p1","field":"text","delta":"A"}}),
+            mocked: false,
+            mock_rule_id: None,
+            dropped: false,
         },
         SseRecord {
             seq: 3,
@@ -284,6 +412,9 @@ fn fold_events_keeps_non_deltas_intact() {
             message_id: Some("m1".into()),
             part_id: Some("p1".into()),
             payload: json!({"type":"message.part.delta","properties":{"sessionID":"s1","messageID":"m1","partID":"p1","field":"text","delta":"B"}}),
+            mocked: false,
+            mock_rule_id: None,
+            dropped: false,
         },
     ];
     let folded = fold_sse_events(records);

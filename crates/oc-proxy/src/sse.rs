@@ -1,15 +1,19 @@
-use crate::state::{AppState, OutgoingSseFrame, SseClientEntry, SseClientKind};
+use crate::state::{AppState, OutgoingSseFrame, PendingBreakpointEntry, SseClientEntry, SseClientKind};
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event as AxumSseEvent, Sse};
 use futures_util::StreamExt;
-use oc_core::{ProxyMode, SseSource};
+use oc_core::{
+    extract_event_ids, json_merge_patch, now_ms, BreakpointDecision, BreakpointKind,
+    ControlWsEvent, PendingBreakpoint, ProxyMode, SseMockActionType, SseSource, TemplateContext,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 /// OpenCode's GlobalSDKProvider enforces a 15s heartbeat watchdog (`HEARTBEAT_TIMEOUT_MS = 15_000`).
@@ -204,12 +208,224 @@ fn handle_upstream_sse_payload(state: &Arc<AppState>, raw: &str) {
         if state.is_recording() {
             if let Ok(rec) = state
                 .storage
-                .insert_sse_event(oc_core::now_ms(), SseSource::Upstream, &dir, &payload)
+                .insert_sse_event(now_ms(), SseSource::Upstream, &dir, &payload)
             {
-                state.broadcast(oc_core::ControlWsEvent::SseRecorded { event: rec });
+                state.broadcast(ControlWsEvent::SseRecorded { event: rec });
             }
         }
         return;
+    }
+
+    if state.rules_active() {
+        let (session_id, _, _) = extract_event_ids(&payload);
+        let raw_payload = serde_json::to_string(&payload).unwrap_or_default();
+        if let Ok(Some(rule)) = state.storage.find_matching_sse_rule(
+            event_type,
+            session_id.as_deref(),
+            &dir,
+            &raw_payload,
+        ) {
+            let _ = state.storage.record_sse_rule_hit(&rule.id, rule.one_shot);
+            state.broadcast(ControlWsEvent::SseRulesUpdated);
+
+            let ctx = TemplateContext {
+                session_id: session_id
+                    .clone()
+                    .unwrap_or_else(|| "ses_mock_001".to_string()),
+                directory: dir.clone(),
+                method: "SSE".to_string(),
+                path: event_type.to_string(),
+            };
+
+            match rule.action_type {
+                SseMockActionType::Drop => {
+                    state.emit_sse_with_meta(
+                        SseSource::Upstream,
+                        &dir,
+                        payload,
+                        true,
+                        Some(rule.id),
+                        true,
+                    );
+                    return;
+                }
+                SseMockActionType::Delay => {
+                    let state_bg = Arc::clone(state);
+                    let rule_id = rule.id;
+                    let delay_ms = rule.delay_ms;
+                    tokio::spawn(async move {
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        state_bg.emit_sse_with_meta(
+                            SseSource::Upstream,
+                            &dir,
+                            payload,
+                            true,
+                            Some(rule_id),
+                            false,
+                        );
+                    });
+                    return;
+                }
+                SseMockActionType::Patch => {
+                    let state_bg = Arc::clone(state);
+                    let rule_id = rule.id;
+                    let delay_ms = rule.delay_ms;
+                    let patch_opt = rule.patch;
+                    tokio::spawn(async move {
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        let mut patched = payload;
+                        if let Some(patch_val) = patch_opt {
+                            let resolved_patch = ctx.apply_value(&patch_val);
+                            json_merge_patch(&mut patched, &resolved_patch);
+                        }
+                        state_bg.emit_sse_with_meta(
+                            SseSource::Upstream,
+                            &dir,
+                            patched,
+                            true,
+                            Some(rule_id),
+                            false,
+                        );
+                    });
+                    return;
+                }
+                SseMockActionType::Replace => {
+                    // Record original upstream frame as suppressed/replaced for visibility
+                    state.emit_sse_with_meta(
+                        SseSource::Upstream,
+                        &dir,
+                        payload,
+                        true,
+                        Some(rule.id.clone()),
+                        true,
+                    );
+                    let state_bg = Arc::clone(state);
+                    let rule_id = rule.id;
+                    let delay_ms = rule.delay_ms;
+                    let mut steps = rule.replace_events;
+                    if steps.is_empty() {
+                        if let Some(single_val) = rule.patch {
+                            steps.push(oc_core::MockSseStep {
+                                delay_ms: 0,
+                                payload: single_val,
+                                directory: None,
+                                event: None,
+                                id: None,
+                                apply_to_shadow: true,
+                            });
+                        }
+                    }
+                    tokio::spawn(async move {
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        state_bg.spawn_sse_steps(rule_id, steps, ctx, SseSource::Injected);
+                    });
+                    return;
+                }
+                SseMockActionType::Breakpoint => {
+                    let state_bg = Arc::clone(state);
+                    let ev_type_str = event_type.to_string();
+                    tokio::spawn(async move {
+                        let bp_id =
+                            format!("bp_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+                        let (tx, rx) = oneshot::channel();
+                        let bp = PendingBreakpoint {
+                            id: bp_id.clone(),
+                            kind: BreakpointKind::SseEvent,
+                            trace_id: format!(
+                                "sse_{}",
+                                &uuid::Uuid::new_v4().simple().to_string()[..8]
+                            ),
+                            rule_id: rule.id.clone(),
+                            rule_name: rule.name.clone(),
+                            started_at: now_ms(),
+                            method: "SSE".to_string(),
+                            path: ev_type_str.clone(),
+                            query: None,
+                            directory: Some(dir.clone()),
+                            req_headers: BTreeMap::new(),
+                            req_body: None,
+                            res_status: None,
+                            res_headers: BTreeMap::new(),
+                            res_body: None,
+                            sse_event_type: Some(ev_type_str),
+                            sse_session_id: session_id,
+                            sse_payload: Some(payload.clone()),
+                        };
+                        state_bg.breakpoints.insert(
+                            bp_id.clone(),
+                            PendingBreakpointEntry {
+                                info: bp.clone(),
+                                tx,
+                            },
+                        );
+                        state_bg.broadcast(ControlWsEvent::BreakpointAdded { breakpoint: bp });
+                        state_bg.broadcast_status();
+
+                        let decision = tokio::time::timeout(Duration::from_secs(300), rx).await;
+                        state_bg.breakpoints.remove(&bp_id);
+                        state_bg.broadcast(ControlWsEvent::BreakpointResolved { id: bp_id });
+                        state_bg.broadcast_status();
+
+                        match decision {
+                            Ok(Ok(BreakpointDecision::EmitSse {
+                                payload: edited,
+                                directory: edited_dir,
+                                apply_to_shadow,
+                            })) => {
+                                let target_dir = edited_dir
+                                    .filter(|d| !d.trim().is_empty())
+                                    .unwrap_or(dir);
+                                if apply_to_shadow.unwrap_or(false) {
+                                    state_bg.shadow.write().unwrap().apply_event(&edited);
+                                }
+                                state_bg.emit_sse_with_meta(
+                                    SseSource::Upstream,
+                                    &target_dir,
+                                    edited,
+                                    true,
+                                    Some(rule.id),
+                                    false,
+                                );
+                            }
+                            Ok(Ok(BreakpointDecision::Drop))
+                            | Ok(Ok(BreakpointDecision::Abort { .. })) => {
+                                state_bg.emit_sse_with_meta(
+                                    SseSource::Upstream,
+                                    &dir,
+                                    payload,
+                                    true,
+                                    Some(rule.id),
+                                    true,
+                                );
+                            }
+                            Ok(Ok(BreakpointDecision::Forward { req_body, .. })) => {
+                                let out_payload = req_body
+                                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                                    .unwrap_or(payload);
+                                state_bg.emit_sse_with_meta(
+                                    SseSource::Upstream,
+                                    &dir,
+                                    out_payload,
+                                    true,
+                                    Some(rule.id),
+                                    false,
+                                );
+                            }
+                            _ => {
+                                state_bg.emit_sse(SseSource::Upstream, &dir, payload);
+                            }
+                        }
+                    });
+                    return;
+                }
+            }
+        }
     }
 
     state.emit_sse(SseSource::Upstream, &dir, payload);

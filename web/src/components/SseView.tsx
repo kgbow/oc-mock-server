@@ -1,7 +1,7 @@
-import { useMemo, useState } from 'react'
-import { Layers, Send, Sparkles, X } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { Layers, RotateCcw, Save, Send, Sparkles, Wand2, X } from 'lucide-react'
 import { api } from '../api'
-import type { OpenApiSummary, SseRecord } from '../types'
+import type { OpenApiSummary, SseMockActionType, SseMockRule, SseRecord } from '../types'
 
 interface FoldedGroup {
   kind: 'folded'
@@ -19,7 +19,6 @@ interface FoldedGroup {
 type DisplayRow = { kind: 'single'; record: SseRecord } | FoldedGroup
 
 function foldClientSide(records: SseRecord[]): DisplayRow[] {
-  // Input is newest-first; fold chronologically then reverse for display
   const chrono = [...records].reverse()
   const out: DisplayRow[] = []
   let acc: FoldedGroup | null = null
@@ -32,7 +31,7 @@ function foldClientSide(records: SseRecord[]): DisplayRow[] {
   }
 
   for (const r of chrono) {
-    if (r.event_type === 'message.part.delta') {
+    if (r.event_type === 'message.part.delta' && !r.dropped) {
       const props = (r.payload as { properties?: { partID?: string; delta?: string } })?.properties
       const pid = props?.partID ?? r.part_id ?? ''
       const delta = props?.delta ?? ''
@@ -67,13 +66,18 @@ function foldClientSide(records: SseRecord[]): DisplayRow[] {
 
 export function SseView(props: {
   events: SseRecord[]
+  sseRules: SseMockRule[]
   openapi: OpenApiSummary | null
   activeDirectories: string[]
+  onSseRulesChanged: () => void
   onNotify: (msg: string, isErr?: boolean) => void
 }) {
   const [filterText, setFilterText] = useState('')
   const [foldDeltas, setFoldDeltas] = useState(true)
   const [selected, setSelected] = useState<DisplayRow | null>(null)
+  const [inspectorTab, setInspectorTab] = useState<'edit' | 'rule'>('edit')
+
+  // Top manual injector drawer
   const [showInjector, setShowInjector] = useState(false)
   const [injectType, setInjectType] = useState('permission.asked')
   const [injectDir, setInjectDir] = useState('')
@@ -95,6 +99,40 @@ export function SseView(props: {
       2,
     ),
   )
+
+  // Selected frame manual editor + rule builder state
+  const [editPayloadText, setEditPayloadText] = useState('')
+  const [editDirectory, setEditDirectory] = useState('')
+  const [editApplyShadow, setEditApplyShadow] = useState(true)
+  const [mutatePrompt, setMutatePrompt] = useState('Mutate fields to simulate tool error or permission prompt')
+  const [mutating, setMutating] = useState(false)
+
+  const [ruleName, setRuleName] = useState('')
+  const [rulePattern, setRulePattern] = useState('')
+  const [ruleSession, setRuleSession] = useState('')
+  const [ruleContains, setRuleContains] = useState('')
+  const [ruleAction, setRuleAction] = useState<SseMockActionType>('replace')
+  const [ruleDelayMs, setRuleDelayMs] = useState(0)
+  const [ruleOneShot, setRuleOneShot] = useState(false)
+
+  const activeRecord: SseRecord | null = useMemo(() => {
+    if (!selected) return null
+    return selected.kind === 'single' ? selected.record : selected.records[selected.records.length - 1] ?? null
+  }, [selected])
+
+  useEffect(() => {
+    if (!activeRecord) return
+    const formatted = JSON.stringify(activeRecord.payload, null, 2)
+    setEditPayloadText(formatted)
+    setEditDirectory(activeRecord.directory === 'global' ? '' : activeRecord.directory)
+    setRuleName(`SSE ${activeRecord.event_type}`)
+    setRulePattern(activeRecord.event_type)
+    setRuleSession('')
+    setRuleContains('')
+    setRuleAction('replace')
+    setRuleDelayMs(0)
+    setRuleOneShot(activeRecord.event_type === 'message.part.delta')
+  }, [activeRecord?.seq])
 
   const filtered = useMemo(() => {
     const q = filterText.trim().toLowerCase()
@@ -120,21 +158,78 @@ export function SseView(props: {
     }
   }
 
-  const sendInject = async () => {
+  const sendInject = async (rawJson: string, dirOverride: string, shadowFlag: boolean) => {
     let payload: unknown
     try {
-      payload = JSON.parse(injectJson)
+      payload = JSON.parse(rawJson)
     } catch {
-      props.onNotify('Inject payload is not valid JSON', true)
+      props.onNotify('SSE payload is not valid JSON', true)
       return
     }
     try {
       await api.injectSse({
-        directory: injectDir || props.activeDirectories[0],
+        directory: dirOverride || props.activeDirectories[0],
         payload,
-        apply_to_shadow: applyShadow,
+        apply_to_shadow: shadowFlag,
       })
-      props.onNotify('Injected SSE event to connected clients')
+      props.onNotify('Emitted edited SSE event to connected clients')
+    } catch (e) {
+      props.onNotify(String(e), true)
+    }
+  }
+
+  const runMutateSelected = async () => {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(editPayloadText)
+    } catch {
+      props.onNotify('Editor JSON must be valid before running AI Mutate', true)
+      return
+    }
+    setMutating(true)
+    try {
+      const res = await api.llmMutate({ payload: parsed, instruction: mutatePrompt })
+      setEditPayloadText(JSON.stringify(res.data, null, 2))
+      props.onNotify('AI mutation applied — tweak manually or click Emit Edited Event')
+    } catch (e) {
+      props.onNotify(String(e), true)
+    } finally {
+      setMutating(false)
+    }
+  }
+
+  const saveSseRuleFromInspector = async () => {
+    if (!rulePattern.trim()) {
+      props.onNotify('Event type pattern is required', true)
+      return
+    }
+    let parsedJson: unknown = undefined
+    if (ruleAction === 'patch' || ruleAction === 'replace') {
+      try {
+        parsedJson = JSON.parse(editPayloadText)
+      } catch {
+        props.onNotify('Edited SSE JSON is not valid JSON', true)
+        return
+      }
+    }
+    try {
+      await api.createSseRule({
+        name: ruleName.trim() || `${ruleAction} ${rulePattern.trim()}`,
+        event_type_pattern: rulePattern.trim(),
+        session_filter: ruleSession.trim() || null,
+        directory_filter: editDirectory.trim() || null,
+        payload_contains: ruleContains.trim() || null,
+        action_type: ruleAction,
+        delay_ms: ruleDelayMs,
+        patch: ruleAction === 'patch' ? parsedJson : undefined,
+        replace_events:
+          ruleAction === 'replace'
+            ? [{ delay_ms: 0, payload: parsedJson, apply_to_shadow: editApplyShadow }]
+            : [],
+        one_shot: ruleOneShot,
+      })
+      props.onSseRulesChanged()
+      props.onNotify(`Saved SSE ${ruleAction} rule for ${rulePattern.trim()}`)
     } catch (e) {
       props.onNotify(String(e), true)
     }
@@ -160,13 +255,13 @@ export function SseView(props: {
         </div>
         <div className="toolbar-group">
           <span className="mono" style={{ color: 'var(--text-muted)', fontSize: 11.5 }}>
-            {filtered.length} rows ({props.events.length} raw frames)
+            {filtered.length} rows ({props.events.length} raw frames · {props.sseRules.filter((r) => r.enabled).length} active SSE rules)
           </span>
           <button
             className={`btn btn-sm ${showInjector ? 'btn-primary' : ''}`}
             onClick={() => setShowInjector((v) => !v)}
           >
-            <Send size={12} /> Inject Event
+            <Send size={12} /> Custom SSE Injector
           </button>
         </div>
       </div>
@@ -199,7 +294,7 @@ export function SseView(props: {
               <input type="checkbox" checked={applyShadow} onChange={(e) => setApplyShadow(e.target.checked)} />
               Update ShadowStore
             </label>
-            <button className="btn btn-sm btn-primary" onClick={sendInject}>
+            <button className="btn btn-sm btn-primary" onClick={() => sendInject(injectJson, injectDir, applyShadow)}>
               <Send size={12} /> Emit to Clients
             </button>
           </div>
@@ -223,7 +318,7 @@ export function SseView(props: {
               <thead>
                 <tr>
                   <th>Seq</th>
-                  <th>Source</th>
+                  <th>Source / Flags</th>
                   <th>Event Type</th>
                   <th>Session</th>
                   <th>Directory</th>
@@ -265,12 +360,26 @@ export function SseView(props: {
                   const srcBadge =
                     r.source === 'replay' ? 'badge-warn' : r.source === 'injected' ? 'badge-info' : 'badge-neutral'
                   return (
-                    <tr key={key} className={isSel ? 'selected' : ''} onClick={() => setSelected(row)}>
+                    <tr
+                      key={key}
+                      className={isSel ? 'selected' : ''}
+                      style={r.dropped ? { opacity: 0.65 } : undefined}
+                      onClick={() => setSelected(row)}
+                    >
                       <td className="mono" style={{ color: 'var(--text-muted)' }}>
                         #{r.seq}
                       </td>
                       <td>
                         <span className={`badge ${srcBadge}`}>{r.source}</span>
+                        {r.dropped ? (
+                          <span className="badge badge-err" style={{ marginLeft: 4 }}>
+                            DROPPED
+                          </span>
+                        ) : r.mocked ? (
+                          <span className="badge badge-warn" style={{ marginLeft: 4 }}>
+                            MOCK
+                          </span>
+                        ) : null}
                       </td>
                       <td className="mono" style={{ fontWeight: 500, color: 'var(--accent-strong)' }}>
                         {r.event_type}
@@ -290,8 +399,8 @@ export function SseView(props: {
           )}
         </div>
 
-        {selected && (
-          <aside className="pane-right">
+        {selected && activeRecord && (
+          <aside className="pane-right" style={{ width: '50%', maxWidth: 740 }}>
             <div className="inspector-header">
               <span className="mono" style={{ fontWeight: 600 }}>
                 {selected.kind === 'single'
@@ -302,24 +411,214 @@ export function SseView(props: {
                 <X size={14} />
               </button>
             </div>
+
+            <div className="tab-strip">
+              <button
+                className={`tab-btn ${inspectorTab === 'edit' ? 'active' : ''}`}
+                onClick={() => setInspectorTab('edit')}
+              >
+                Manual Edit &amp; Re-emit
+              </button>
+              <button
+                className={`tab-btn ${inspectorTab === 'rule' ? 'active' : ''}`}
+                onClick={() => setInspectorTab('rule')}
+              >
+                Save as SSE Mock / Breakpoint Rule
+              </button>
+            </div>
+
             <div className="inspector-body">
-              {selected.kind === 'single' ? (
-                <pre className="code-block">{JSON.stringify(selected.record.payload, null, 2)}</pre>
-              ) : (
-                <>
-                  <div className="panel" style={{ padding: 10 }}>
-                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>
-                      Concatenated delta text ({selected.records.length} frames, part {selected.part_id})
-                    </div>
-                    <pre className="code-block">
-                      {selected.records
-                        .map((r) => (r.payload as { properties?: { delta?: string } })?.properties?.delta ?? '')
-                        .join('')}
-                    </pre>
+              {selected.kind === 'folded' && (
+                <div className="panel" style={{ padding: 10 }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>
+                    Concatenated delta text ({selected.records.length} frames, part {selected.part_id})
                   </div>
-                  <div className="panel-title">Raw Frames</div>
-                  <pre className="code-block">{JSON.stringify(selected.records, null, 2)}</pre>
+                  <pre className="code-block" style={{ maxHeight: 140 }}>
+                    {selected.records
+                      .map((r) => (r.payload as { properties?: { delta?: string } })?.properties?.delta ?? '')
+                      .join('')}
+                  </pre>
+                </div>
+              )}
+
+              {inspectorTab === 'edit' && (
+                <>
+                  <div className="toolbar-group" style={{ justifyContent: 'space-between' }}>
+                    <div className="toolbar-group">
+                      <input
+                        className="input mono"
+                        style={{ width: 210 }}
+                        placeholder={props.activeDirectories[0] ?? 'Target directory'}
+                        value={editDirectory}
+                        onChange={(e) => setEditDirectory(e.target.value)}
+                      />
+                      <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 11.5 }}>
+                        <input
+                          type="checkbox"
+                          checked={editApplyShadow}
+                          onChange={(e) => setEditApplyShadow(e.target.checked)}
+                        />
+                        ShadowStore
+                      </label>
+                    </div>
+                    <div className="toolbar-group" style={{ gap: 4 }}>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => {
+                          try {
+                            setEditPayloadText(JSON.stringify(JSON.parse(editPayloadText), null, 2))
+                          } catch {
+                            props.onNotify('Not valid JSON', true)
+                          }
+                        }}
+                      >
+                        Format
+                      </button>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => setEditPayloadText(JSON.stringify(activeRecord.payload, null, 2))}
+                        title="Reset to captured frame"
+                      >
+                        <RotateCcw size={11} /> Reset
+                      </button>
+                      <button
+                        className="btn btn-sm btn-primary"
+                        onClick={() => sendInject(editPayloadText, editDirectory, editApplyShadow)}
+                      >
+                        <Send size={11} /> Emit Edited Event
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="field">
+                    <label>Editable SSE Event Payload JSON</label>
+                    <textarea
+                      className="textarea"
+                      rows={13}
+                      value={editPayloadText}
+                      onChange={(e) => setEditPayloadText(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="panel" style={{ padding: 10 }}>
+                    <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginBottom: 6 }}>
+                      Optional AI Helper (mutates editor JSON above for further manual editing)
+                    </div>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <input
+                        className="input"
+                        style={{ flex: 1 }}
+                        value={mutatePrompt}
+                        onChange={(e) => setMutatePrompt(e.target.value)}
+                      />
+                      <button className="btn btn-sm" disabled={mutating} onClick={runMutateSelected}>
+                        <Sparkles size={12} /> {mutating ? 'Mutating...' : 'AI Mutate'}
+                      </button>
+                    </div>
+                  </div>
                 </>
+              )}
+
+              {inspectorTab === 'rule' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <div className="form-grid">
+                    <div className="field">
+                      <label>Rule Name</label>
+                      <input className="input" value={ruleName} onChange={(e) => setRuleName(e.target.value)} />
+                    </div>
+                    <div className="field">
+                      <label>Action</label>
+                      <select
+                        className="select"
+                        value={ruleAction}
+                        onChange={(e) => setRuleAction(e.target.value as SseMockActionType)}
+                      >
+                        <option value="replace">Replace with Edited Payload Below</option>
+                        <option value="patch">JSON Merge Patch with Payload Below</option>
+                        <option value="drop">Drop / Suppress Matching Events</option>
+                        <option value="delay">Artificial Delay Only</option>
+                        <option value="breakpoint">Suspend Live SSE Breakpoint</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="form-grid">
+                    <div className="field">
+                      <label>Event Type Pattern (* or regex:)</label>
+                      <input
+                        className="input mono"
+                        value={rulePattern}
+                        onChange={(e) => setRulePattern(e.target.value)}
+                      />
+                    </div>
+                    <div className="field">
+                      <label>Session Filter (optional)</label>
+                      <input
+                        className="input mono"
+                        placeholder={activeRecord.session_id ?? 'Any session'}
+                        value={ruleSession}
+                        onChange={(e) => setRuleSession(e.target.value)}
+                      />
+                    </div>
+                    <div className="field">
+                      <label>Payload Contains (optional)</label>
+                      <input
+                        className="input mono"
+                        placeholder="Keyword or regex:..."
+                        value={ruleContains}
+                        onChange={(e) => setRuleContains(e.target.value)}
+                      />
+                    </div>
+                    <div className="field">
+                      <label>Delay (ms)</label>
+                      <input
+                        className="input mono"
+                        type="number"
+                        value={ruleDelayMs}
+                        onChange={(e) => setRuleDelayMs(Number(e.target.value))}
+                      />
+                    </div>
+                  </div>
+
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                    <input
+                      type="checkbox"
+                      checked={ruleOneShot}
+                      onChange={(e) => setRuleOneShot(e.target.checked)}
+                    />
+                    One-shot (auto-disable after 1 hit)
+                  </label>
+
+                  {(ruleAction === 'replace' || ruleAction === 'patch') && (
+                    <div className="field">
+                      <label>
+                        {ruleAction === 'replace'
+                          ? 'Replacement SSE Event JSON'
+                          : 'JSON Merge Patch Object'}
+                      </label>
+                      <textarea
+                        className="textarea"
+                        rows={10}
+                        value={editPayloadText}
+                        onChange={(e) => setEditPayloadText(e.target.value)}
+                      />
+                    </div>
+                  )}
+
+                  <div className="toolbar-group">
+                    <button className="btn btn-primary" onClick={saveSseRuleFromInspector}>
+                      <Save size={13} /> Save SSE Rule
+                    </button>
+                    {activeRecord.session_id && !ruleSession && (
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => setRuleSession(activeRecord.session_id ?? '')}
+                      >
+                        <Wand2 size={11} /> Pin to Session {activeRecord.session_id}
+                      </button>
+                    )}
+                  </div>
+                </div>
               )}
             </div>
           </aside>

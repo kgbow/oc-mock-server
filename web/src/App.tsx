@@ -31,11 +31,18 @@ import type {
   ProxyMode,
   ProxyRuntimeStatus,
   SessionOverview,
+  SseMockRule,
   SseRecord,
   TapeSummary,
 } from './types'
 
 type NavTab = 'network' | 'sse' | 'mock' | 'breakpoints' | 'replay' | 'anomalies' | 'config'
+
+const MODE_TITLES: Record<ProxyMode, string> = {
+  passthrough: 'Pure Passthrough: captures traffic and bypasses all HTTP/SSE mock & breakpoint rules',
+  intercept: 'Active Interception: evaluates all enabled HTTP/SSE mock rules and live breakpoints',
+  replay: 'Session Replay: mounts ShadowStore virtual sessions and mutes upstream SSE',
+}
 
 export default function App() {
   const [tab, setTab] = useState<NavTab>('network')
@@ -44,6 +51,7 @@ export default function App() {
   const [traces, setTraces] = useState<HttpTraceSummary[]>([])
   const [sseEvents, setSseEvents] = useState<SseRecord[]>([])
   const [rules, setRules] = useState<MockRule[]>([])
+  const [sseRules, setSseRules] = useState<SseMockRule[]>([])
   const [breakpoints, setBreakpoints] = useState<PendingBreakpoint[]>([])
   const [tapes, setTapes] = useState<TapeSummary[]>([])
   const [sessions, setSessions] = useState<SessionOverview[]>([])
@@ -51,6 +59,8 @@ export default function App() {
   const [openapi, setOpenapi] = useState<OpenApiSummary | null>(null)
   const [toast, setToast] = useState<{ msg: string; isErr: boolean } | null>(null)
   const toastTimer = useRef<number | null>(null)
+  const tabRef = useRef<NavTab>('network')
+  tabRef.current = tab
 
   const notify = useCallback((msg: string, isErr = false) => {
     setToast({ msg, isErr })
@@ -60,6 +70,10 @@ export default function App() {
 
   const loadRules = useCallback(() => {
     api.listRules().then(setRules).catch(() => {})
+  }, [])
+
+  const loadSseRules = useCallback(() => {
+    api.listSseRules().then(setSseRules).catch(() => {})
   }, [])
 
   const loadTapes = useCallback(() => {
@@ -87,11 +101,12 @@ export default function App() {
       .then((list) => setSseEvents(list as SseRecord[]))
       .catch(() => {})
     loadRules()
+    loadSseRules()
     loadBreakpoints()
     loadTapes()
     loadOpenApi()
     loadDiagnostics()
-  }, [loadRules, loadBreakpoints, loadTapes, loadOpenApi, loadDiagnostics])
+  }, [loadRules, loadSseRules, loadBreakpoints, loadTapes, loadOpenApi, loadDiagnostics])
 
   useEffect(() => {
     loadInitial()
@@ -138,6 +153,9 @@ export default function App() {
               break
             case 'breakpoint_added':
               setBreakpoints((prev) => [...prev.filter((b) => b.id !== msg.breakpoint.id), msg.breakpoint])
+              if (tabRef.current !== 'breakpoints') {
+                notify(`Breakpoint suspended: ${msg.breakpoint.method} ${msg.breakpoint.path}`)
+              }
               break
             case 'breakpoint_resolved':
               setBreakpoints((prev) => prev.filter((b) => b.id !== msg.id))
@@ -147,6 +165,9 @@ export default function App() {
               break
             case 'rules_updated':
               loadRules()
+              break
+            case 'sse_rules_updated':
+              loadSseRules()
               break
             case 'tapes_updated':
               loadTapes()
@@ -162,12 +183,19 @@ export default function App() {
       if (reconnectTimer) window.clearTimeout(reconnectTimer)
       ws?.close()
     }
-  }, [loadRules, loadTapes])
+  }, [loadRules, loadSseRules, loadTapes, notify])
 
   const changeMode = async (mode: ProxyMode) => {
     try {
       const next = await api.setMode(mode)
       setStatus(next)
+      if (mode === 'passthrough') {
+        notify('Switched to Passthrough — all mock & breakpoint rules are temporarily bypassed')
+      } else if (mode === 'intercept') {
+        notify('Switched to Intercept — enabled HTTP & SSE rules/breakpoints are active')
+      } else {
+        notify('Switched to Replay — ShadowStore active & upstream SSE muted')
+      }
     } catch (e) {
       notify(String(e), true)
     }
@@ -204,6 +232,10 @@ export default function App() {
     }
   }
 
+  const enabledRuleCount =
+    rules.filter((r) => r.enabled).length + sseRules.filter((r) => r.enabled).length
+  const totalRuleCount = rules.length + sseRules.length
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -227,12 +259,23 @@ export default function App() {
               <button
                 key={m}
                 className={status?.mode === m ? 'active' : ''}
+                title={MODE_TITLES[m]}
                 onClick={() => changeMode(m)}
               >
                 {m === 'passthrough' ? 'Passthrough' : m === 'intercept' ? 'Intercept' : 'Replay'}
               </button>
             ))}
           </div>
+
+          {status?.mode === 'passthrough' && enabledRuleCount > 0 && (
+            <button
+              className="btn btn-sm btn-warn"
+              onClick={() => changeMode('intercept')}
+              title="Click to switch to Intercept mode so enabled rules take effect"
+            >
+              {enabledRuleCount} rule(s) bypassed — Enable Intercept
+            </button>
+          )}
         </div>
 
         <div className="topbar-right">
@@ -293,7 +336,7 @@ export default function App() {
             <span className="nav-item-label">
               <Wand2 size={14} /> Mock &amp; AI
             </span>
-            <span className="nav-badge">{rules.length}</span>
+            <span className="nav-badge">{totalRuleCount}</span>
           </button>
           <button className={`nav-item ${tab === 'breakpoints' ? 'active' : ''}`} onClick={() => setTab('breakpoints')}>
             <span className="nav-item-label">
@@ -324,6 +367,12 @@ export default function App() {
 
           <div className="sidebar-footer mono">
             <div className="sidebar-stat">
+              <span>Active Rules</span>
+              <span style={{ color: status?.mode === 'passthrough' ? 'var(--text-muted)' : 'var(--ok)' }}>
+                {status?.mode === 'passthrough' ? `0 (${enabledRuleCount} paused)` : enabledRuleCount}
+              </span>
+            </div>
+            <div className="sidebar-stat">
               <span>SSE Clients</span>
               <span style={{ color: 'var(--text-primary)' }}>{status?.connected_sse_clients ?? 0}</span>
             </div>
@@ -342,34 +391,55 @@ export default function App() {
 
         <main className="main-area">
           {tab === 'network' && (
-            <NetworkView traces={traces} onNotify={notify} onRulesChanged={loadRules} />
+            <NetworkView
+              traces={traces}
+              rules={rules}
+              openapi={openapi}
+              activeDirectories={status?.active_directories ?? []}
+              onNotify={notify}
+              onRulesChanged={loadRules}
+            />
           )}
           {tab === 'sse' && (
             <SseView
               events={sseEvents}
+              sseRules={sseRules}
               openapi={openapi}
               activeDirectories={status?.active_directories ?? []}
+              onSseRulesChanged={loadSseRules}
               onNotify={notify}
             />
           )}
           {tab === 'mock' && (
             <MockStudioView
               rules={rules}
+              sseRules={sseRules}
               openapi={openapi}
               activeDirectories={status?.active_directories ?? []}
               onRefreshRules={loadRules}
+              onRefreshSseRules={loadSseRules}
               onRefreshOpenApi={loadOpenApi}
               onRefreshTapes={loadTapes}
               onNotify={notify}
             />
           )}
           {tab === 'breakpoints' && (
-            <BreakpointsView breakpoints={breakpoints} onRefresh={loadBreakpoints} onNotify={notify} />
+            <BreakpointsView
+              breakpoints={breakpoints}
+              rules={rules}
+              sseRules={sseRules}
+              openapi={openapi}
+              onRefresh={loadBreakpoints}
+              onRefreshRules={loadRules}
+              onRefreshSseRules={loadSseRules}
+              onNotify={notify}
+            />
           )}
           {tab === 'replay' && (
             <ReplayView
               tapes={tapes}
               sessions={sessions}
+              openapi={openapi}
               replay={
                 status?.replay ?? {
                   state: 'stopped',

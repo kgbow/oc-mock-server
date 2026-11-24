@@ -1,21 +1,42 @@
 import { useEffect, useState } from 'react'
 import {
+  ArrowDown,
+  ArrowUp,
+  Copy,
   Download,
+  Edit3,
   ExternalLink,
   Pause,
   Play,
+  Plus,
+  Save,
   SkipForward,
   Square,
   Terminal,
   Trash2,
   Upload,
+  X,
 } from 'lucide-react'
 import { api } from '../api'
-import type { ReplayStatus, SessionOverview, TapeSummary } from '../types'
+import type {
+  OpenApiSummary,
+  ReplayStatus,
+  SessionOverview,
+  Tape,
+  TapeEvent,
+  TapeSummary,
+} from '../types'
+
+interface EditableFrame {
+  offset_ms: number
+  directory: string
+  payloadText: string
+}
 
 export function ReplayView(props: {
   tapes: TapeSummary[]
   sessions: SessionOverview[]
+  openapi: OpenApiSummary | null
   replay: ReplayStatus
   activeDirectories: string[]
   onRefreshTapes: () => void
@@ -28,6 +49,16 @@ export function ReplayView(props: {
   const [importText, setImportText] = useState('')
   const [showImport, setShowImport] = useState(false)
   const [shadowSnapshot, setShadowSnapshot] = useState<unknown>(null)
+
+  // Visual Tape Editor state
+  const [editingTape, setEditingTape] = useState<Tape | null>(null)
+  const [tapeName, setTapeName] = useState('')
+  const [tapeDesc, setTapeDesc] = useState('')
+  const [tapeDir, setTapeDir] = useState('')
+  const [tapeSid, setTapeSid] = useState('')
+  const [tapeSnapText, setTapeSnapText] = useState('{}')
+  const [frames, setFrames] = useState<EditableFrame[]>([])
+  const [selFrameIdx, setSelFrameIdx] = useState(0)
 
   useEffect(() => {
     if (!targetDir && props.activeDirectories[0]) {
@@ -45,6 +76,148 @@ export function ReplayView(props: {
       .then(setShadowSnapshot)
       .catch(() => {})
   }, [props.replay.session_id, props.replay.cursor])
+
+  const openTapeEditor = async (tapeId?: string) => {
+    if (!tapeId) {
+      const defDir = props.activeDirectories[0] ?? '/workspace/project'
+      const defSid = `ses_custom_${Math.random().toString(36).slice(2, 8)}`
+      setEditingTape({
+        id: '',
+        name: 'Custom SSE Scenario Tape',
+        description: 'Manually authored SSE sequence',
+        directory: defDir,
+        session_id: defSid,
+        snapshot: {},
+        events: [],
+        created_at: 0,
+      })
+      setTapeName('Custom SSE Scenario Tape')
+      setTapeDesc('Manually authored SSE sequence')
+      setTapeDir(defDir)
+      setTapeSid(defSid)
+      setTapeSnapText('{}')
+      setFrames([
+        {
+          offset_ms: 0,
+          directory: defDir,
+          payloadText: JSON.stringify(
+            {
+              type: 'session.created',
+              properties: {
+                info: {
+                  id: defSid,
+                  directory: defDir,
+                  title: 'Custom Mocked Session',
+                  time: { created: Date.now(), updated: Date.now() },
+                },
+              },
+            },
+            null,
+            2,
+          ),
+        },
+      ])
+      setSelFrameIdx(0)
+      return
+    }
+
+    try {
+      const t = await api.getTape(tapeId)
+      setEditingTape(t)
+      setTapeName(t.name)
+      setTapeDesc(t.description ?? '')
+      setTapeDir(t.directory)
+      setTapeSid(t.session_id ?? '')
+      setTapeSnapText(JSON.stringify(t.snapshot ?? {}, null, 2))
+      setFrames(
+        t.events.map((ev) => ({
+          offset_ms: ev.offset_ms,
+          directory: ev.directory,
+          payloadText: JSON.stringify(ev.payload, null, 2),
+        })),
+      )
+      setSelFrameIdx(0)
+    } catch (e) {
+      props.onNotify(String(e), true)
+    }
+  }
+
+  const saveEditedTape = async () => {
+    if (!editingTape) return
+    let parsedSnap: Record<string, unknown> = {}
+    try {
+      parsedSnap = JSON.parse(tapeSnapText || '{}') as Record<string, unknown>
+    } catch {
+      props.onNotify('Initial Snapshot JSON is invalid', true)
+      return
+    }
+
+    const events: TapeEvent[] = []
+    for (let i = 0; i < frames.length; i++) {
+      try {
+        events.push({
+          offset_ms: Math.max(0, Number(frames[i].offset_ms) || 0),
+          directory: frames[i].directory.trim() || tapeDir || '/workspace/project',
+          payload: JSON.parse(frames[i].payloadText),
+        })
+      } catch {
+        props.onNotify(`Frame #${i + 1} payload is not valid JSON`, true)
+        return
+      }
+    }
+
+    try {
+      const saved = await api.saveTape({
+        id: editingTape.id || undefined,
+        name: tapeName.trim() || 'Untitled Tape',
+        description: tapeDesc.trim() || null,
+        directory: tapeDir.trim() || '/workspace/project',
+        session_id: tapeSid.trim() || null,
+        snapshot: parsedSnap,
+        events,
+        created_at: editingTape.created_at,
+      })
+      props.onRefreshTapes()
+      setEditingTape(saved)
+      props.onNotify(`Saved tape "${saved.name}" (${saved.events.length} SSE frames)`)
+    } catch (e) {
+      props.onNotify(String(e), true)
+    }
+  }
+
+  const addEditorFrame = async (evType = 'message.part.delta') => {
+    const lastOffset = frames.length > 0 ? frames[frames.length - 1].offset_ms + 200 : 0
+    let sample: unknown = {
+      type: evType,
+      properties: { sessionID: tapeSid || 'ses_custom_001' },
+    }
+    try {
+      sample = await api.fakeSse(evType, tapeDir || props.activeDirectories[0])
+    } catch {}
+    const nextIdx = frames.length
+    setFrames((prev) => [
+      ...prev,
+      {
+        offset_ms: lastOffset,
+        directory: tapeDir || props.activeDirectories[0] || '/workspace/project',
+        payloadText: JSON.stringify(sample, null, 2),
+      },
+    ])
+    setSelFrameIdx(nextIdx)
+  }
+
+  const moveFrame = (idx: number, delta: -1 | 1) => {
+    const target = idx + delta
+    if (target < 0 || target >= frames.length) return
+    setFrames((prev) => {
+      const copy = [...prev]
+      const tmp = copy[idx]
+      copy[idx] = copy[target]
+      copy[target] = tmp
+      return copy
+    })
+    setSelFrameIdx(target)
+  }
 
   const loadTape = async (tapeId: string) => {
     try {
@@ -116,6 +289,8 @@ export function ReplayView(props: {
     }
   }
 
+  const currentFrame = frames[selFrameIdx] ?? null
+
   return (
     <>
       <div className="replay-deck">
@@ -166,6 +341,9 @@ export function ReplayView(props: {
           </div>
 
           <div className="toolbar-group">
+            <button className="btn btn-sm" onClick={() => openTapeEditor()}>
+              <Plus size={12} /> New Custom Tape
+            </button>
             <button
               className="btn btn-sm"
               disabled={!props.replay.session_id}
@@ -227,112 +405,348 @@ export function ReplayView(props: {
         </div>
       </div>
 
-      <div className="split-pane">
-        <div className="pane-left" style={{ padding: 14, gap: 12 }}>
-          <div className="toolbar-group" style={{ justifyContent: 'space-between' }}>
-            <div className="toolbar-group">
-              <select className="select mono" value={extractSid} onChange={(e) => setExtractSid(e.target.value)}>
-                <option value="">Extract tape from captured session...</option>
-                {props.sessions.map((s) => (
-                  <option key={s.session_id} value={s.session_id}>
-                    {s.session_id} ({s.sse_count} SSE)
-                  </option>
-                ))}
-              </select>
-              <button className="btn btn-sm" disabled={!extractSid} onClick={handleExtract}>
-                Extract Tape
-              </button>
-            </div>
-            <button className="btn btn-sm" onClick={() => setShowImport((v) => !v)}>
-              <Upload size={12} /> Import .tape.jsonl
-            </button>
-          </div>
-
-          {showImport && (
+      {editingTape ? (
+        <div className="split-pane">
+          <div className="pane-left" style={{ padding: 14, gap: 12 }}>
             <div className="panel">
-              <div className="panel-title">Import Portable .tape.jsonl</div>
-              <textarea
-                className="textarea"
-                rows={6}
-                placeholder="Paste .tape.jsonl content here..."
-                value={importText}
-                onChange={(e) => setImportText(e.target.value)}
-              />
-              <div className="toolbar-group" style={{ marginTop: 8 }}>
-                <button className="btn btn-sm btn-primary" onClick={handleImport}>
-                  Import Tape
+              <div className="panel-title">
+                <span>Tape Metadata — {editingTape.id || 'New Tape'}</span>
+                <div className="toolbar-group">
+                  <button className="btn btn-sm btn-primary" onClick={saveEditedTape}>
+                    <Save size={12} /> Save Tape
+                  </button>
+                  {editingTape.id && (
+                    <button className="btn btn-sm" onClick={() => loadTape(editingTape.id)}>
+                      <Play size={12} /> Load in Player
+                    </button>
+                  )}
+                  <button className="btn btn-sm btn-ghost" onClick={() => setEditingTape(null)}>
+                    <X size={14} /> Close Editor
+                  </button>
+                </div>
+              </div>
+              <div className="form-grid">
+                <div className="field">
+                  <label>Tape Name</label>
+                  <input className="input" value={tapeName} onChange={(e) => setTapeName(e.target.value)} />
+                </div>
+                <div className="field">
+                  <label>Session ID</label>
+                  <input className="input mono" value={tapeSid} onChange={(e) => setTapeSid(e.target.value)} />
+                </div>
+                <div className="field">
+                  <label>Default Directory</label>
+                  <input className="input mono" value={tapeDir} onChange={(e) => setTapeDir(e.target.value)} />
+                </div>
+                <div className="field">
+                  <label>Description</label>
+                  <input className="input" value={tapeDesc} onChange={(e) => setTapeDesc(e.target.value)} />
+                </div>
+              </div>
+            </div>
+
+            <div className="toolbar-group" style={{ justifyContent: 'space-between' }}>
+              <span style={{ fontWeight: 600, fontSize: 12.5 }}>SSE Event Frames ({frames.length})</span>
+              <div className="toolbar-group">
+                <select
+                  className="select"
+                  defaultValue=""
+                  onChange={(e) => {
+                    if (e.target.value) {
+                      addEditorFrame(e.target.value)
+                      e.target.value = ''
+                    }
+                  }}
+                >
+                  <option value="">+ Add Frame from OpenAPI...</option>
+                  {(props.openapi?.events ?? []).map((ev) => (
+                    <option key={ev.event_type} value={ev.event_type}>
+                      {ev.event_type}
+                    </option>
+                  ))}
+                </select>
+                <button className="btn btn-sm" onClick={() => addEditorFrame('message.part.delta')}>
+                  <Plus size={12} /> Add Frame
                 </button>
               </div>
             </div>
-          )}
 
-          <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Tape Name</th>
-                  <th>Session ID</th>
-                  <th>Frames</th>
-                  <th>Duration</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {props.tapes.map((t) => (
-                  <tr key={t.id} className={props.replay.tape_id === t.id ? 'selected' : ''}>
-                    <td style={{ fontWeight: 500 }}>
-                      {t.name}
-                      {t.description && (
-                        <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t.description}</div>
-                      )}
-                    </td>
-                    <td className="mono">{t.session_id ?? '—'}</td>
-                    <td className="mono">{t.event_count}</td>
-                    <td className="mono">{t.duration_ms}ms</td>
-                    <td style={{ textAlign: 'right' }}>
-                      <div className="toolbar-group" style={{ justifyContent: 'flex-end' }}>
-                        <button className="btn btn-sm btn-primary" onClick={() => loadTape(t.id)}>
-                          Load
-                        </button>
-                        <button className="btn btn-sm" onClick={() => handleExport(t)} title="Export .tape.jsonl">
-                          <Download size={12} />
-                        </button>
-                        <button
-                          className="btn btn-sm btn-danger"
-                          onClick={async () => {
-                            await api.deleteTape(t.id)
-                            props.onRefreshTapes()
-                          }}
-                        >
-                          <Trash2 size={12} />
-                        </button>
-                      </div>
-                    </td>
+            <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Offset (ms)</th>
+                    <th>Event Type</th>
+                    <th>Preview</th>
+                    <th></th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {frames.map((f, idx) => {
+                    let evType = 'invalid-json'
+                    try {
+                      evType = String((JSON.parse(f.payloadText) as { type?: string })?.type ?? 'unknown')
+                    } catch {}
+                    return (
+                      <tr
+                        key={idx}
+                        className={selFrameIdx === idx ? 'selected' : ''}
+                        onClick={() => setSelFrameIdx(idx)}
+                      >
+                        <td className="mono" style={{ color: 'var(--text-muted)' }}>
+                          {idx + 1}
+                        </td>
+                        <td className="mono">+{f.offset_ms}ms</td>
+                        <td className="mono" style={{ color: 'var(--accent-strong)', fontWeight: 500 }}>
+                          {evType}
+                        </td>
+                        <td className="mono" style={{ color: 'var(--text-secondary)' }}>
+                          {f.payloadText.replace(/\s+/g, ' ').slice(0, 90)}
+                        </td>
+                        <td style={{ textAlign: 'right' }} onClick={(e) => e.stopPropagation()}>
+                          <div className="toolbar-group" style={{ justifyContent: 'flex-end', gap: 3 }}>
+                            <button className="btn btn-sm" onClick={() => moveFrame(idx, -1)} title="Move up">
+                              <ArrowUp size={11} />
+                            </button>
+                            <button className="btn btn-sm" onClick={() => moveFrame(idx, 1)} title="Move down">
+                              <ArrowDown size={11} />
+                            </button>
+                            <button
+                              className="btn btn-sm"
+                              onClick={() => {
+                                setFrames((prev) => [
+                                  ...prev.slice(0, idx + 1),
+                                  { ...prev[idx], offset_ms: prev[idx].offset_ms + 100 },
+                                  ...prev.slice(idx + 1),
+                                ])
+                                setSelFrameIdx(idx + 1)
+                              }}
+                              title="Duplicate frame"
+                            >
+                              <Copy size={11} />
+                            </button>
+                            <button
+                              className="btn btn-sm btn-danger"
+                              onClick={() => {
+                                setFrames((prev) => prev.filter((_, i) => i !== idx))
+                                if (selFrameIdx >= frames.length - 1) {
+                                  setSelFrameIdx(Math.max(0, frames.length - 2))
+                                }
+                              }}
+                              title="Delete frame"
+                            >
+                              <Trash2 size={11} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
           </div>
-        </div>
 
-        <aside className="pane-right">
-          <div className="inspector-header">
-            <span className="mono" style={{ fontWeight: 600 }}>
-              Live ShadowStore Projection
-            </span>
-            <span className="badge badge-info">{props.replay.session_id ?? 'idle'}</span>
-          </div>
-          <div className="inspector-body">
-            {shadowSnapshot ? (
-              <pre className="code-block">{JSON.stringify(shadowSnapshot, null, 2)}</pre>
-            ) : (
-              <div className="empty-state">
-                Load and play/step a tape to inspect the live ShadowStore state served to OpenCode clients on <code>GET /session*</code>.
+          <aside className="pane-right" style={{ width: '50%', maxWidth: 740 }}>
+            <div className="inspector-header">
+              <span className="mono" style={{ fontWeight: 600 }}>
+                {currentFrame ? `Edit Frame #${selFrameIdx + 1}` : 'Initial Tape Snapshot'}
+              </span>
+              {currentFrame && (
+                <button
+                  className="btn btn-sm"
+                  onClick={() => {
+                    try {
+                      const formatted = JSON.stringify(JSON.parse(currentFrame.payloadText), null, 2)
+                      setFrames((prev) =>
+                        prev.map((f, i) => (i === selFrameIdx ? { ...f, payloadText: formatted } : f)),
+                      )
+                    } catch {
+                      props.onNotify('Not valid JSON', true)
+                    }
+                  }}
+                >
+                  Format JSON
+                </button>
+              )}
+            </div>
+            <div className="inspector-body">
+              {currentFrame && (
+                <>
+                  <div className="form-grid">
+                    <div className="field">
+                      <label>Offset from Start (ms)</label>
+                      <input
+                        className="input mono"
+                        type="number"
+                        value={currentFrame.offset_ms}
+                        onChange={(e) => {
+                          const v = Number(e.target.value)
+                          setFrames((prev) =>
+                            prev.map((f, i) => (i === selFrameIdx ? { ...f, offset_ms: v } : f)),
+                          )
+                        }}
+                      />
+                    </div>
+                    <div className="field">
+                      <label>Frame Directory</label>
+                      <input
+                        className="input mono"
+                        value={currentFrame.directory}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          setFrames((prev) =>
+                            prev.map((f, i) => (i === selFrameIdx ? { ...f, directory: v } : f)),
+                          )
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <div className="field">
+                    <label>SSE Event Payload JSON</label>
+                    <textarea
+                      className="textarea"
+                      rows={15}
+                      value={currentFrame.payloadText}
+                      onChange={(e) => {
+                        const val = e.target.value
+                        setFrames((prev) =>
+                          prev.map((f, i) => (i === selFrameIdx ? { ...f, payloadText: val } : f)),
+                        )
+                      }}
+                    />
+                  </div>
+                </>
+              )}
+
+              <div className="field">
+                <label>Bootstrap Snapshot JSON (optional initial sessions/messages/todos)</label>
+                <textarea
+                  className="textarea"
+                  rows={5}
+                  value={tapeSnapText}
+                  onChange={(e) => setTapeSnapText(e.target.value)}
+                />
+              </div>
+            </div>
+          </aside>
+        </div>
+      ) : (
+        <div className="split-pane">
+          <div className="pane-left" style={{ padding: 14, gap: 12 }}>
+            <div className="toolbar-group" style={{ justifyContent: 'space-between' }}>
+              <div className="toolbar-group">
+                <select className="select mono" value={extractSid} onChange={(e) => setExtractSid(e.target.value)}>
+                  <option value="">Extract tape from captured session...</option>
+                  {props.sessions.map((s) => (
+                    <option key={s.session_id} value={s.session_id}>
+                      {s.session_id} ({s.sse_count} SSE)
+                    </option>
+                  ))}
+                </select>
+                <button className="btn btn-sm" disabled={!extractSid} onClick={handleExtract}>
+                  Extract Tape
+                </button>
+              </div>
+              <button className="btn btn-sm" onClick={() => setShowImport((v) => !v)}>
+                <Upload size={12} /> Import .tape.jsonl
+              </button>
+            </div>
+
+            {showImport && (
+              <div className="panel">
+                <div className="panel-title">Import Portable .tape.jsonl</div>
+                <textarea
+                  className="textarea"
+                  rows={6}
+                  placeholder="Paste .tape.jsonl content here..."
+                  value={importText}
+                  onChange={(e) => setImportText(e.target.value)}
+                />
+                <div className="toolbar-group" style={{ marginTop: 8 }}>
+                  <button className="btn btn-sm btn-primary" onClick={handleImport}>
+                    Import Tape
+                  </button>
+                </div>
               </div>
             )}
+
+            <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Tape Name</th>
+                    <th>Session ID</th>
+                    <th>Frames</th>
+                    <th>Duration</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {props.tapes.map((t) => (
+                    <tr key={t.id} className={props.replay.tape_id === t.id ? 'selected' : ''}>
+                      <td style={{ fontWeight: 500 }}>
+                        {t.name}
+                        {t.description && (
+                          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{t.description}</div>
+                        )}
+                      </td>
+                      <td className="mono">{t.session_id ?? '—'}</td>
+                      <td className="mono">{t.event_count}</td>
+                      <td className="mono">{t.duration_ms}ms</td>
+                      <td style={{ textAlign: 'right' }}>
+                        <div className="toolbar-group" style={{ justifyContent: 'flex-end' }}>
+                          <button className="btn btn-sm btn-primary" onClick={() => loadTape(t.id)}>
+                            Load
+                          </button>
+                          <button
+                            className="btn btn-sm"
+                            onClick={() => openTapeEditor(t.id)}
+                            title="Manually edit SSE frames & timestamps"
+                          >
+                            <Edit3 size={12} /> Edit
+                          </button>
+                          <button className="btn btn-sm" onClick={() => handleExport(t)} title="Export .tape.jsonl">
+                            <Download size={12} />
+                          </button>
+                          <button
+                            className="btn btn-sm btn-danger"
+                            onClick={async () => {
+                              await api.deleteTape(t.id)
+                              props.onRefreshTapes()
+                            }}
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
-        </aside>
-      </div>
+
+          <aside className="pane-right">
+            <div className="inspector-header">
+              <span className="mono" style={{ fontWeight: 600 }}>
+                Live ShadowStore Projection
+              </span>
+              <span className="badge badge-info">{props.replay.session_id ?? 'idle'}</span>
+            </div>
+            <div className="inspector-body">
+              {shadowSnapshot ? (
+                <pre className="code-block">{JSON.stringify(shadowSnapshot, null, 2)}</pre>
+              ) : (
+                <div className="empty-state">
+                  Load and play/step a tape to inspect the live ShadowStore state served to OpenCode clients on <code>GET /session*</code>, or click <strong>Edit</strong> on any tape to manually modify SSE frames.
+                </div>
+              )}
+            </div>
+          </aside>
+        </div>
+      )}
     </>
   )
 }

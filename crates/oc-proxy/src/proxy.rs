@@ -348,10 +348,10 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
     let (parts, req_body) = req.into_parts();
     let started_at = now_ms();
     let trace_id = format!("tr_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
-    let method = parts.method;
+    let mut method = parts.method;
     let uri = parts.uri;
-    let path = uri.path().to_string();
-    let query = uri.query().map(ToOwned::to_owned);
+    let mut path = uri.path().to_string();
+    let mut query = uri.query().map(ToOwned::to_owned);
     let req_headers_map = headers_to_map(&parts.headers);
     let directory = extract_directory(&query, &parts.headers);
     if let Some(ref d) = directory {
@@ -398,47 +398,148 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
         });
     }
 
-    // 1. Evaluate Mock / Patch / Breakpoint Rules
-    let matched_rule = state
-        .storage
-        .find_matching_rule(method.as_str(), &path, directory.as_deref())
-        .ok()
-        .flatten();
-
-    let mut patch_to_apply: Option<(String, Value)> = None;
+    // 1. Evaluate Mock / Patch / SseStream / Breakpoint Rules (active in Intercept & Replay modes)
+    let mut patch_to_apply: Option<(String, Option<Value>, Vec<MockSseStep>)> = None;
+    let mut response_breakpoint_rule: Option<(String, String)> = None;
     let mut breakpoint_forward_body: Option<Bytes> = None;
     let mut req_body_opt = Some(req_body);
 
+    let matched_rule = if state.rules_active() {
+        let needs_body_match = state
+            .storage
+            .has_body_dependent_rule(
+                method.as_str(),
+                &path,
+                query.as_deref(),
+                directory.as_deref(),
+            )
+            .unwrap_or(false);
+
+        if needs_body_match {
+            match collect_full_body(req_body_opt.take().unwrap()).await {
+                Ok(raw_bytes) => {
+                    let captured = full_utf8_capture(&raw_bytes);
+                    trace.req_size = raw_bytes.len();
+                    if recording {
+                        trace.req_body = captured.clone();
+                    }
+                    let matched = state
+                        .storage
+                        .find_matching_rule_ext(
+                            method.as_str(),
+                            &path,
+                            query.as_deref(),
+                            directory.as_deref(),
+                            captured.as_deref(),
+                        )
+                        .ok()
+                        .flatten();
+                    breakpoint_forward_body = Some(raw_bytes);
+                    matched
+                }
+                Err(err) => {
+                    return finalize_and_respond(
+                        &state,
+                        recording,
+                        &mut trace,
+                        400,
+                        json_headers(),
+                        serde_json::to_vec(&json!({ "error": err })).unwrap_or_default(),
+                        false,
+                        None,
+                        Some(err),
+                    );
+                }
+            }
+        } else {
+            state
+                .storage
+                .find_matching_rule_ext(
+                    method.as_str(),
+                    &path,
+                    query.as_deref(),
+                    directory.as_deref(),
+                    None,
+                )
+                .ok()
+                .flatten()
+        }
+    } else {
+        None
+    };
+
     if let Some(rule) = matched_rule {
+        let _ = state.storage.record_mock_rule_hit(&rule.id, rule.one_shot);
+        state.broadcast(ControlWsEvent::RulesUpdated);
+
         match rule.action_type {
             MockActionType::Direct => {
-                match drain_body_for_trace(req_body_opt.take().unwrap(), recording).await {
-                    Ok((sz, bd)) => {
-                        trace.req_size = sz;
-                        trace.req_body = bd;
-                    }
-                    Err(err) => {
-                        return finalize_and_respond(
-                            &state,
-                            recording,
-                            &mut trace,
-                            400,
-                            json_headers(),
-                            serde_json::to_vec(&json!({ "error": err })).unwrap_or_default(),
-                            false,
-                            None,
-                            Some(err),
-                        );
+                if let Some(rem_body) = req_body_opt.take() {
+                    match drain_body_for_trace(rem_body, recording).await {
+                        Ok((sz, bd)) => {
+                            trace.req_size = sz;
+                            trace.req_body = bd;
+                        }
+                        Err(err) => {
+                            return finalize_and_respond(
+                                &state,
+                                recording,
+                                &mut trace,
+                                400,
+                                json_headers(),
+                                serde_json::to_vec(&json!({ "error": err })).unwrap_or_default(),
+                                false,
+                                None,
+                                Some(err),
+                            );
+                        }
                     }
                 }
                 if rule.delay_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(rule.delay_ms)).await;
                 }
+                let eff_dir = directory
+                    .clone()
+                    .unwrap_or_else(|| state.primary_active_directory());
+                let eff_sid = session_id.clone().or_else(|| {
+                    trace
+                        .req_body
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .and_then(|v| {
+                            v.get("sessionID")
+                                .or_else(|| v.get("session_id"))
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned)
+                        })
+                });
+                let mut ctx = TemplateContext {
+                    session_id: eff_sid
+                        .clone()
+                        .unwrap_or_else(|| "ses_mock_001".to_string()),
+                    directory: eff_dir,
+                    method: method.to_string(),
+                    path: path.clone(),
+                };
                 let body_text = match &rule.body {
-                    Some(Value::String(s)) => s.clone(),
-                    Some(v) => serde_json::to_string(v).unwrap_or_default(),
+                    Some(Value::String(s)) => ctx.apply_str(s),
+                    Some(v) => serde_json::to_string(&ctx.apply_value(v)).unwrap_or_default(),
                     None => "{}".to_string(),
                 };
+                if eff_sid.is_none() {
+                    if let Some(created_sid) = extract_session_from_body(&path, &body_text) {
+                        trace.session_id = Some(created_sid.clone());
+                        ctx.session_id = created_sid;
+                    }
+                }
+                if !rule.sse_sequence.is_empty() {
+                    state.spawn_sse_steps(
+                        rule.id.clone(),
+                        rule.sse_sequence.clone(),
+                        ctx,
+                        SseSource::Injected,
+                    );
+                }
                 let mut res_headers = rule.headers.clone();
                 res_headers
                     .entry("content-type".to_string())
@@ -456,121 +557,282 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                     None,
                 );
             }
-            MockActionType::Breakpoint => {
-                let raw_req_bytes = match collect_full_body(req_body_opt.take().unwrap()).await {
-                    Ok(b) => b,
-                    Err(err) => {
-                        return finalize_and_respond(
-                            &state,
-                            recording,
-                            &mut trace,
-                            400,
-                            json_headers(),
-                            serde_json::to_vec(&json!({ "error": err })).unwrap_or_default(),
-                            false,
-                            None,
-                            Some(err),
-                        );
+            MockActionType::SseStream => {
+                if let Some(rem_body) = req_body_opt.take() {
+                    match drain_body_for_trace(rem_body, recording).await {
+                        Ok((sz, bd)) => {
+                            trace.req_size = sz;
+                            trace.req_body = bd;
+                        }
+                        Err(err) => {
+                            return finalize_and_respond(
+                                &state,
+                                recording,
+                                &mut trace,
+                                400,
+                                json_headers(),
+                                serde_json::to_vec(&json!({ "error": err })).unwrap_or_default(),
+                                false,
+                                None,
+                                Some(err),
+                            );
+                        }
                     }
-                };
-                let bp_captured = full_utf8_capture(&raw_req_bytes);
-                trace.req_size = raw_req_bytes.len();
-                if recording {
-                    trace.req_body = bp_captured.clone();
                 }
-
-                let bp_id = format!("bp_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
-                let (tx, rx) = oneshot::channel();
-                let bp = PendingBreakpoint {
-                    id: bp_id.clone(),
-                    trace_id: trace_id.clone(),
-                    rule_id: rule.id.clone(),
-                    rule_name: rule.name.clone(),
-                    started_at,
+                if rule.delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(rule.delay_ms)).await;
+                }
+                let eff_dir = directory
+                    .clone()
+                    .unwrap_or_else(|| state.primary_active_directory());
+                let ctx = TemplateContext {
+                    session_id: session_id
+                        .clone()
+                        .unwrap_or_else(|| "ses_mock_001".to_string()),
+                    directory: eff_dir,
                     method: method.to_string(),
                     path: path.clone(),
-                    query: query.clone(),
-                    directory: directory.clone(),
-                    req_headers: eff_req_headers.clone(),
-                    req_body: bp_captured.clone(),
                 };
-                state.breakpoints.insert(
-                    bp_id.clone(),
-                    PendingBreakpointEntry {
-                        info: bp.clone(),
-                        tx,
+                let mut res_headers = rule.headers.clone();
+                res_headers.insert("content-type".into(), "text/event-stream".into());
+                res_headers.insert("cache-control".into(), "no-cache".into());
+                res_headers.insert("x-oc-proxy-mocked".into(), "sse-stream".into());
+
+                trace.status = Some(rule.status);
+                trace.res_headers = res_headers.clone();
+                trace.mocked = true;
+                trace.mock_rule_id = Some(rule.id.clone());
+
+                let mut steps = rule.sse_sequence.clone();
+                if steps.is_empty() {
+                    if let Some(single_body) = rule.body {
+                        steps.push(MockSseStep {
+                            delay_ms: 0,
+                            payload: single_body,
+                            directory: None,
+                            event: None,
+                            id: None,
+                            apply_to_shadow: false,
+                        });
+                    }
+                }
+
+                let finalizer = StreamTraceFinalizer {
+                    state: Arc::clone(&state),
+                    recording,
+                    trace,
+                    req_capture: None,
+                    res_capture: BodyCapture::new(recording),
+                    extract_session_body: false,
+                    finished: false,
+                };
+                let trace_id_header = finalizer.trace.id.clone();
+
+                let body_stream = futures_util::stream::unfold(
+                    (steps.into_iter(), ctx, finalizer),
+                    |(mut iter, ctx, mut fin)| async move {
+                        match iter.next() {
+                            Some(step) => {
+                                if step.delay_ms > 0 {
+                                    tokio::time::sleep(Duration::from_millis(step.delay_ms)).await;
+                                }
+                                let resolved = ctx.apply_value(&step.payload);
+                                let data_str = match &resolved {
+                                    Value::String(s) => s.clone(),
+                                    other => serde_json::to_string(other).unwrap_or_default(),
+                                };
+                                let mut frame = String::new();
+                                if let Some(ref id_val) = step.id {
+                                    frame.push_str(&format!("id: {}\n", ctx.apply_str(id_val)));
+                                }
+                                if let Some(ref ev_name) = step.event {
+                                    frame.push_str(&format!("event: {}\n", ctx.apply_str(ev_name)));
+                                }
+                                for line in data_str.lines() {
+                                    frame.push_str(&format!("data: {line}\n"));
+                                }
+                                if data_str.is_empty() {
+                                    frame.push_str("data: \n");
+                                }
+                                frame.push('\n');
+                                let bytes = Bytes::from(frame.into_bytes());
+                                fin.res_capture.observe_chunk(&bytes);
+                                Some((Ok::<Bytes, std::io::Error>(bytes), (iter, ctx, fin)))
+                            }
+                            None => {
+                                fin.finish(None);
+                                None
+                            }
+                        }
                     },
                 );
-                state.broadcast(ControlWsEvent::BreakpointAdded { breakpoint: bp });
-                state.broadcast_status();
 
-                let decision = tokio::time::timeout(Duration::from_secs(300), rx).await;
-                state.breakpoints.remove(&bp_id);
-                state.broadcast(ControlWsEvent::BreakpointResolved { id: bp_id });
-                state.broadcast_status();
-
-                match decision {
-                    Ok(Ok(BreakpointDecision::Respond {
-                        status,
-                        mut headers,
-                        body,
-                    })) => {
-                        headers
-                            .entry("content-type".to_string())
-                            .or_insert_with(|| "application/json".to_string());
-                        headers.insert("x-oc-proxy-mocked".into(), "breakpoint".into());
-                        return finalize_and_respond(
-                            &state,
-                            recording,
-                            &mut trace,
-                            status,
-                            headers,
-                            body.into_bytes(),
-                            true,
-                            Some(rule.id),
-                            None,
-                        );
+                let mut resp_builder = Response::builder().status(rule.status);
+                for (k, v) in res_headers {
+                    if let (Ok(hn), Ok(hv)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_str(&v),
+                    ) {
+                        resp_builder = resp_builder.header(hn, hv);
                     }
-                    Ok(Ok(BreakpointDecision::Forward {
-                        req_body: edited_body,
-                        req_headers,
-                    })) => {
-                        if let Some(h) = req_headers {
-                            eff_req_headers = h;
-                            trace.req_headers = eff_req_headers.clone();
+                }
+                if let Ok(hv) = HeaderValue::from_str(&trace_id_header) {
+                    resp_builder = resp_builder.header("x-oc-proxy-trace-id", hv);
+                }
+                return resp_builder
+                    .body(Body::from_stream(body_stream))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+            MockActionType::Breakpoint => {
+                if rule.breakpoint_phase.intercepts_response() {
+                    response_breakpoint_rule = Some((rule.id.clone(), rule.name.clone()));
+                }
+
+                if rule.breakpoint_phase.intercepts_request() {
+                    let raw_req_bytes = if let Some(already) = breakpoint_forward_body.take() {
+                        already
+                    } else {
+                        match collect_full_body(req_body_opt.take().unwrap()).await {
+                            Ok(b) => b,
+                            Err(err) => {
+                                return finalize_and_respond(
+                                    &state,
+                                    recording,
+                                    &mut trace,
+                                    400,
+                                    json_headers(),
+                                    serde_json::to_vec(&json!({ "error": err })).unwrap_or_default(),
+                                    false,
+                                    None,
+                                    Some(err),
+                                );
+                            }
                         }
-                        if let Some(b) = edited_body {
-                            if Some(b.as_str()) != bp_captured.as_deref() {
-                                let edited_bytes = Bytes::from(b.into_bytes());
-                                trace.req_size = edited_bytes.len();
-                                if recording {
-                                    trace.req_body = full_utf8_capture(&edited_bytes);
+                    };
+                    let bp_captured = full_utf8_capture(&raw_req_bytes);
+                    trace.req_size = raw_req_bytes.len();
+                    if recording {
+                        trace.req_body = bp_captured.clone();
+                    }
+
+                    let bp_id = format!("bp_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+                    let (tx, rx) = oneshot::channel();
+                    let bp = PendingBreakpoint {
+                        id: bp_id.clone(),
+                        kind: BreakpointKind::HttpRequest,
+                        trace_id: trace_id.clone(),
+                        rule_id: rule.id.clone(),
+                        rule_name: rule.name.clone(),
+                        started_at,
+                        method: method.to_string(),
+                        path: path.clone(),
+                        query: query.clone(),
+                        directory: directory.clone(),
+                        req_headers: eff_req_headers.clone(),
+                        req_body: bp_captured.clone(),
+                        res_status: None,
+                        res_headers: BTreeMap::new(),
+                        res_body: None,
+                        sse_event_type: None,
+                        sse_session_id: None,
+                        sse_payload: None,
+                    };
+                    state.breakpoints.insert(
+                        bp_id.clone(),
+                        PendingBreakpointEntry {
+                            info: bp.clone(),
+                            tx,
+                        },
+                    );
+                    state.broadcast(ControlWsEvent::BreakpointAdded { breakpoint: bp });
+                    state.broadcast_status();
+
+                    let decision = tokio::time::timeout(Duration::from_secs(300), rx).await;
+                    state.breakpoints.remove(&bp_id);
+                    state.broadcast(ControlWsEvent::BreakpointResolved { id: bp_id });
+                    state.broadcast_status();
+
+                    match decision {
+                        Ok(Ok(BreakpointDecision::Respond {
+                            status,
+                            mut headers,
+                            body,
+                        })) => {
+                            headers
+                                .entry("content-type".to_string())
+                                .or_insert_with(|| "application/json".to_string());
+                            headers.insert("x-oc-proxy-mocked".into(), "breakpoint".into());
+                            return finalize_and_respond(
+                                &state,
+                                recording,
+                                &mut trace,
+                                status,
+                                headers,
+                                body.into_bytes(),
+                                true,
+                                Some(rule.id),
+                                None,
+                            );
+                        }
+                        Ok(Ok(BreakpointDecision::Forward {
+                            method: edited_method,
+                            path: edited_path,
+                            query: edited_query,
+                            req_body: edited_body,
+                            req_headers,
+                        })) => {
+                            if let Some(m) = edited_method.filter(|s| !s.trim().is_empty()) {
+                                if let Ok(parsed_m) = Method::from_bytes(m.trim().as_bytes()) {
+                                    method = parsed_m;
+                                    trace.method = method.to_string();
                                 }
-                                breakpoint_forward_body = Some(edited_bytes);
+                            }
+                            if let Some(p) = edited_path.filter(|s| !s.trim().is_empty()) {
+                                path = p;
+                                trace.path = path.clone();
+                            }
+                            if let Some(q) = edited_query {
+                                query = if q.is_empty() { None } else { Some(q) };
+                                trace.query = query.clone();
+                            }
+                            if let Some(h) = req_headers {
+                                eff_req_headers = h;
+                                trace.req_headers = eff_req_headers.clone();
+                            }
+                            if let Some(b) = edited_body {
+                                if Some(b.as_str()) != bp_captured.as_deref() {
+                                    let edited_bytes = Bytes::from(b.into_bytes());
+                                    trace.req_size = edited_bytes.len();
+                                    if recording {
+                                        trace.req_body = full_utf8_capture(&edited_bytes);
+                                    }
+                                    breakpoint_forward_body = Some(edited_bytes);
+                                } else {
+                                    breakpoint_forward_body = Some(raw_req_bytes);
+                                }
                             } else {
                                 breakpoint_forward_body = Some(raw_req_bytes);
                             }
-                        } else {
+                        }
+                        Ok(Ok(BreakpointDecision::Abort { message })) => {
+                            let msg =
+                                message.unwrap_or_else(|| "aborted at breakpoint".to_string());
+                            return finalize_and_respond(
+                                &state,
+                                recording,
+                                &mut trace,
+                                502,
+                                json_headers(),
+                                serde_json::to_vec(&json!({ "error": msg })).unwrap_or_default(),
+                                true,
+                                Some(rule.id),
+                                Some(msg),
+                            );
+                        }
+                        _ => {
+                            // Timed out or channel closed -> proceed with normal forward
                             breakpoint_forward_body = Some(raw_req_bytes);
                         }
-                    }
-                    Ok(Ok(BreakpointDecision::Abort { message })) => {
-                        let msg = message.unwrap_or_else(|| "aborted at breakpoint".to_string());
-                        return finalize_and_respond(
-                            &state,
-                            recording,
-                            &mut trace,
-                            502,
-                            json_headers(),
-                            serde_json::to_vec(&json!({ "error": msg })).unwrap_or_default(),
-                            true,
-                            Some(rule.id),
-                            Some(msg),
-                        );
-                    }
-                    _ => {
-                        // Timed out or channel closed -> proceed with normal forward
-                        breakpoint_forward_body = Some(raw_req_bytes);
                     }
                 }
             }
@@ -578,9 +840,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                 if rule.delay_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(rule.delay_ms)).await;
                 }
-                if let Some(p) = rule.patch {
-                    patch_to_apply = Some((rule.id, p));
-                }
+                patch_to_apply = Some((rule.id, rule.patch, rule.sse_sequence));
             }
         }
     }
@@ -756,7 +1016,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                 }
             }
 
-            let status = res.status().as_u16();
+            let mut status = res.status().as_u16();
             let needs_shadow_merge = method == Method::GET
                 && mount_shadow
                 && status == 200
@@ -765,7 +1025,9 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                     "/session" | "/session/status" | "/permission" | "/question"
                 )
                 && !state.shadow.read().unwrap().sessions.is_empty();
-            let needs_response_buffer = patch_to_apply.is_some() || needs_shadow_merge;
+            let needs_response_buffer = patch_to_apply.is_some()
+                || needs_shadow_merge
+                || response_breakpoint_rule.is_some();
 
             let mut res_headers = BTreeMap::new();
             for (k, v) in res.headers() {
@@ -874,16 +1136,118 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                 }
             }
 
-            // Apply Response JSON Patch if matched a Patch rule
-            if let Some((rid, patch_val)) = patch_to_apply {
-                if let Ok(mut parsed) = serde_json::from_slice::<Value>(&final_bytes) {
-                    json_merge_patch(&mut parsed, &patch_val);
-                    if let Ok(encoded) = serde_json::to_vec(&parsed) {
-                        final_bytes = encoded;
-                        mocked = true;
-                        rule_id = Some(rid);
-                        res_headers.insert("x-oc-proxy-mocked".into(), "patched".into());
+            // Apply Response JSON Patch (and optional triggered SSE sequence) if matched a Patch rule
+            if let Some((rid, patch_opt, sse_seq)) = patch_to_apply {
+                let eff_dir = directory
+                    .clone()
+                    .unwrap_or_else(|| state.primary_active_directory());
+                let ctx = TemplateContext {
+                    session_id: session_id
+                        .clone()
+                        .unwrap_or_else(|| "ses_mock_001".to_string()),
+                    directory: eff_dir,
+                    method: method.to_string(),
+                    path: path.clone(),
+                };
+                if let Some(patch_val) = patch_opt {
+                    if let Ok(mut parsed) = serde_json::from_slice::<Value>(&final_bytes) {
+                        let resolved_patch = ctx.apply_value(&patch_val);
+                        json_merge_patch(&mut parsed, &resolved_patch);
+                        if let Ok(encoded) = serde_json::to_vec(&parsed) {
+                            final_bytes = encoded;
+                            mocked = true;
+                            rule_id = Some(rid.clone());
+                            res_headers.insert("x-oc-proxy-mocked".into(), "patched".into());
+                        }
                     }
+                }
+                if !sse_seq.is_empty() {
+                    mocked = true;
+                    if rule_id.is_none() {
+                        rule_id = Some(rid.clone());
+                    }
+                    state.spawn_sse_steps(rid, sse_seq, ctx, SseSource::Injected);
+                }
+            }
+
+            // Suspend at Response Breakpoint if requested, allowing live manual editing of real upstream response
+            if let Some((bp_rule_id, bp_rule_name)) = response_breakpoint_rule {
+                let bp_id = format!("bp_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
+                let (tx, rx) = oneshot::channel();
+                let res_captured = full_utf8_capture(&final_bytes);
+                let bp = PendingBreakpoint {
+                    id: bp_id.clone(),
+                    kind: BreakpointKind::HttpResponse,
+                    trace_id: trace_id.clone(),
+                    rule_id: bp_rule_id.clone(),
+                    rule_name: bp_rule_name,
+                    started_at,
+                    method: method.to_string(),
+                    path: path.clone(),
+                    query: query.clone(),
+                    directory: directory.clone(),
+                    req_headers: trace.req_headers.clone(),
+                    req_body: trace.req_body.clone(),
+                    res_status: Some(status),
+                    res_headers: res_headers.clone(),
+                    res_body: res_captured,
+                    sse_event_type: None,
+                    sse_session_id: None,
+                    sse_payload: None,
+                };
+                state.breakpoints.insert(
+                    bp_id.clone(),
+                    PendingBreakpointEntry {
+                        info: bp.clone(),
+                        tx,
+                    },
+                );
+                state.broadcast(ControlWsEvent::BreakpointAdded { breakpoint: bp });
+                state.broadcast_status();
+
+                let decision = tokio::time::timeout(Duration::from_secs(300), rx).await;
+                state.breakpoints.remove(&bp_id);
+                state.broadcast(ControlWsEvent::BreakpointResolved { id: bp_id });
+                state.broadcast_status();
+
+                match decision {
+                    Ok(Ok(BreakpointDecision::Respond {
+                        status: edited_status,
+                        headers: mut edited_headers,
+                        body: edited_body,
+                    })) => {
+                        edited_headers.remove("content-length");
+                        if !edited_headers.contains_key("content-type") {
+                            let ct = res_headers
+                                .get("content-type")
+                                .cloned()
+                                .unwrap_or_else(|| "application/json".to_string());
+                            edited_headers.insert("content-type".into(), ct);
+                        }
+                        edited_headers
+                            .insert("x-oc-proxy-mocked".into(), "breakpoint-response".into());
+                        status = edited_status;
+                        res_headers = edited_headers;
+                        final_bytes = edited_body.into_bytes();
+                        mocked = true;
+                        rule_id = Some(bp_rule_id);
+                    }
+                    Ok(Ok(BreakpointDecision::Abort { message })) => {
+                        let msg = message
+                            .unwrap_or_else(|| "aborted at response breakpoint".to_string());
+                        return finalize_and_respond(
+                            &state,
+                            recording,
+                            &mut trace,
+                            502,
+                            json_headers(),
+                            serde_json::to_vec(&json!({ "error": msg })).unwrap_or_default(),
+                            true,
+                            Some(bp_rule_id),
+                            Some(msg),
+                        );
+                    }
+                    _ => {}
                 }
             }
 
@@ -1121,25 +1485,6 @@ fn serve_offline_fallback(
         return Some((200, json!(true)));
     }
     None
-}
-
-fn json_merge_patch(target: &mut Value, patch: &Value) {
-    if let Value::Object(patch_map) = patch {
-        if !target.is_object() {
-            *target = Value::Object(serde_json::Map::new());
-        }
-        let target_map = target.as_object_mut().unwrap();
-        for (k, v) in patch_map {
-            if v.is_null() {
-                target_map.remove(k);
-            } else {
-                let entry = target_map.entry(k.clone()).or_insert(Value::Null);
-                json_merge_patch(entry, v);
-            }
-        }
-    } else {
-        *target = patch.clone();
-    }
 }
 
 fn headers_to_map(headers: &HeaderMap) -> BTreeMap<String, String> {

@@ -46,12 +46,14 @@ pub fn build_control_router(state: Arc<AppState>) -> Router {
         .route("/api/anomalies", get(get_anomalies))
         .route("/api/rules", get(list_rules).post(create_rule))
         .route("/api/rules/{id}", put(update_rule).delete(delete_rule))
+        .route("/api/sse-rules", get(list_sse_rules).post(create_sse_rule))
+        .route("/api/sse-rules/{id}", put(update_sse_rule).delete(delete_sse_rule))
         .route("/api/breakpoints", get(list_breakpoints))
         .route("/api/breakpoints/{id}/resolve", post(resolve_breakpoint))
         .route("/api/tapes", get(list_tapes).post(save_tape))
         .route("/api/tapes/extract/{session_id}", post(extract_tape))
         .route("/api/tapes/import", post(import_tape))
-        .route("/api/tapes/{id}", get(get_tape).delete(delete_tape))
+        .route("/api/tapes/{id}", get(get_tape).put(put_tape).delete(delete_tape))
         .route("/api/tapes/{id}/export", get(export_tape))
         .route("/api/replay/status", get(get_replay_status))
         .route("/api/replay/load", post(replay_load))
@@ -384,19 +386,28 @@ async fn create_rule(
         priority: input.priority,
         method: input.method.to_uppercase(),
         path_pattern: input.path_pattern,
+        query_pattern: input.query_pattern,
+        body_contains: input.body_contains,
         directory_filter: input.directory_filter,
         action_type: input.action_type,
+        breakpoint_phase: input.breakpoint_phase,
+        one_shot: input.one_shot,
+        hit_count: 0,
         status: input.status,
         delay_ms: input.delay_ms,
         headers: input.headers,
         body: input.body,
         patch: input.patch,
+        sse_sequence: input.sse_sequence,
         created_at: now_ms(),
     };
     state
         .storage
         .upsert_mock_rule(&rule)
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if rule.enabled {
+        state.ensure_intercept_if_passthrough();
+    }
     state.broadcast(ControlWsEvent::RulesUpdated);
     Ok(Json(rule))
 }
@@ -406,6 +417,7 @@ async fn update_rule(
     Path(id): Path<String>,
     Json(input): Json<CreateMockRuleInput>,
 ) -> Result<Json<MockRule>, (StatusCode, Json<Value>)> {
+    let existing = state.storage.get_mock_rule(&id).ok().flatten();
     let rule = MockRule {
         id,
         name: input.name,
@@ -413,19 +425,28 @@ async fn update_rule(
         priority: input.priority,
         method: input.method.to_uppercase(),
         path_pattern: input.path_pattern,
+        query_pattern: input.query_pattern,
+        body_contains: input.body_contains,
         directory_filter: input.directory_filter,
         action_type: input.action_type,
+        breakpoint_phase: input.breakpoint_phase,
+        one_shot: input.one_shot,
+        hit_count: existing.as_ref().map(|r| r.hit_count).unwrap_or(0),
         status: input.status,
         delay_ms: input.delay_ms,
         headers: input.headers,
         body: input.body,
         patch: input.patch,
-        created_at: now_ms(),
+        sse_sequence: input.sse_sequence,
+        created_at: existing.map(|r| r.created_at).unwrap_or_else(now_ms),
     };
     state
         .storage
         .upsert_mock_rule(&rule)
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if rule.enabled {
+        state.ensure_intercept_if_passthrough();
+    }
     state.broadcast(ControlWsEvent::RulesUpdated);
     Ok(Json(rule))
 }
@@ -439,6 +460,96 @@ async fn delete_rule(
         .delete_mock_rule(&id)
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     state.broadcast(ControlWsEvent::RulesUpdated);
+    Ok(Json(json!({ "deleted": deleted })))
+}
+
+// ---- SSE Mock Rules ----
+
+async fn list_sse_rules(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<SseMockRule>>, (StatusCode, Json<Value>)> {
+    let rules = state
+        .storage
+        .list_sse_mock_rules()
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(rules))
+}
+
+async fn create_sse_rule(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<CreateSseMockRuleInput>,
+) -> Result<Json<SseMockRule>, (StatusCode, Json<Value>)> {
+    let rule = SseMockRule {
+        id: format!("sserule_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]),
+        name: input.name,
+        enabled: input.enabled,
+        priority: input.priority,
+        event_type_pattern: input.event_type_pattern,
+        session_filter: input.session_filter,
+        directory_filter: input.directory_filter,
+        payload_contains: input.payload_contains,
+        action_type: input.action_type,
+        delay_ms: input.delay_ms,
+        patch: input.patch,
+        replace_events: input.replace_events,
+        one_shot: input.one_shot,
+        hit_count: 0,
+        created_at: now_ms(),
+    };
+    state
+        .storage
+        .upsert_sse_mock_rule(&rule)
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if rule.enabled {
+        state.ensure_intercept_if_passthrough();
+    }
+    state.broadcast(ControlWsEvent::SseRulesUpdated);
+    Ok(Json(rule))
+}
+
+async fn update_sse_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(input): Json<CreateSseMockRuleInput>,
+) -> Result<Json<SseMockRule>, (StatusCode, Json<Value>)> {
+    let existing = state.storage.get_sse_mock_rule(&id).ok().flatten();
+    let rule = SseMockRule {
+        id,
+        name: input.name,
+        enabled: input.enabled,
+        priority: input.priority,
+        event_type_pattern: input.event_type_pattern,
+        session_filter: input.session_filter,
+        directory_filter: input.directory_filter,
+        payload_contains: input.payload_contains,
+        action_type: input.action_type,
+        delay_ms: input.delay_ms,
+        patch: input.patch,
+        replace_events: input.replace_events,
+        one_shot: input.one_shot,
+        hit_count: existing.as_ref().map(|r| r.hit_count).unwrap_or(0),
+        created_at: existing.map(|r| r.created_at).unwrap_or_else(now_ms),
+    };
+    state
+        .storage
+        .upsert_sse_mock_rule(&rule)
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if rule.enabled {
+        state.ensure_intercept_if_passthrough();
+    }
+    state.broadcast(ControlWsEvent::SseRulesUpdated);
+    Ok(Json(rule))
+}
+
+async fn delete_sse_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let deleted = state
+        .storage
+        .delete_sse_mock_rule(&id)
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    state.broadcast(ControlWsEvent::SseRulesUpdated);
     Ok(Json(json!({ "deleted": deleted })))
 }
 
@@ -490,6 +601,23 @@ async fn get_tape(
         .get_tape(&id)
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e))?
         .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "tape not found"))?;
+    Ok(Json(tape))
+}
+
+async fn put_tape(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(mut tape): Json<Tape>,
+) -> Result<Json<Tape>, (StatusCode, Json<Value>)> {
+    tape.id = id;
+    if tape.created_at == 0 {
+        tape.created_at = now_ms();
+    }
+    state
+        .storage
+        .save_tape(&tape)
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    state.broadcast(ControlWsEvent::TapesUpdated);
     Ok(Json(tape))
 }
 

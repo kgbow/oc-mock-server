@@ -66,6 +66,9 @@ export interface SseRecord {
   message_id: string | null
   part_id: string | null
   payload: unknown
+  mocked?: boolean
+  mock_rule_id?: string | null
+  dropped?: boolean
 }
 
 export interface FoldedDeltaItem {
@@ -101,6 +104,19 @@ export interface SessionOverview {
   ignored: boolean
 }
 
+export type MockActionType = 'direct' | 'patch' | 'breakpoint' | 'sse_stream'
+
+export type BreakpointPhase = 'request' | 'response' | 'both'
+
+export interface MockSseStep {
+  delay_ms: number
+  payload: unknown
+  directory?: string | null
+  event?: string | null
+  id?: string | null
+  apply_to_shadow?: boolean
+}
+
 export interface MockRule {
   id: string
   name: string
@@ -108,18 +124,82 @@ export interface MockRule {
   priority: number
   method: string
   path_pattern: string
+  query_pattern: string | null
+  body_contains: string | null
   directory_filter: string | null
-  action_type: 'direct' | 'patch' | 'breakpoint'
+  action_type: MockActionType
+  breakpoint_phase: BreakpointPhase
+  one_shot: boolean
+  hit_count: number
   status: number
   delay_ms: number
   headers: Record<string, string>
   body: unknown | null
   patch: unknown | null
+  sse_sequence: MockSseStep[]
   created_at: number
 }
 
+export interface CreateMockRuleInput {
+  name: string
+  enabled?: boolean
+  priority?: number
+  method: string
+  path_pattern: string
+  query_pattern?: string | null
+  body_contains?: string | null
+  directory_filter?: string | null
+  action_type: MockActionType
+  breakpoint_phase?: BreakpointPhase
+  one_shot?: boolean
+  status?: number
+  delay_ms?: number
+  headers?: Record<string, string>
+  body?: unknown
+  patch?: unknown
+  sse_sequence?: MockSseStep[]
+}
+
+export type SseMockActionType = 'drop' | 'patch' | 'replace' | 'delay' | 'breakpoint'
+
+export interface SseMockRule {
+  id: string
+  name: string
+  enabled: boolean
+  priority: number
+  event_type_pattern: string
+  session_filter: string | null
+  directory_filter: string | null
+  payload_contains: string | null
+  action_type: SseMockActionType
+  delay_ms: number
+  patch: unknown | null
+  replace_events: MockSseStep[]
+  one_shot: boolean
+  hit_count: number
+  created_at: number
+}
+
+export interface CreateSseMockRuleInput {
+  name: string
+  enabled?: boolean
+  priority?: number
+  event_type_pattern: string
+  session_filter?: string | null
+  directory_filter?: string | null
+  payload_contains?: string | null
+  action_type: SseMockActionType
+  delay_ms?: number
+  patch?: unknown
+  replace_events?: MockSseStep[]
+  one_shot?: boolean
+}
+
+export type BreakpointKind = 'http_request' | 'http_response' | 'sse_event'
+
 export interface PendingBreakpoint {
   id: string
+  kind: BreakpointKind
   trace_id: string
   rule_id: string
   rule_name: string
@@ -130,6 +210,39 @@ export interface PendingBreakpoint {
   directory: string | null
   req_headers: Record<string, string>
   req_body: string | null
+  res_status: number | null
+  res_headers: Record<string, string>
+  res_body: string | null
+  sse_event_type: string | null
+  sse_session_id: string | null
+  sse_payload: unknown | null
+}
+
+export interface TapeSnapshot {
+  projects?: unknown[]
+  sessions?: unknown[]
+  messages?: Record<string, unknown[]>
+  parts?: Record<string, unknown[]>
+  statuses?: Record<string, unknown>
+  todos?: Record<string, unknown[]>
+  diffs?: Record<string, unknown[]>
+}
+
+export interface TapeEvent {
+  offset_ms: number
+  directory: string
+  payload: unknown
+}
+
+export interface Tape {
+  id: string
+  name: string
+  description: string | null
+  directory: string
+  session_id: string | null
+  snapshot: TapeSnapshot
+  events: TapeEvent[]
+  created_at: number
 }
 
 export interface TapeSummary {
@@ -193,4 +306,5 @@ export type ControlWsEvent =
   | { type: 'breakpoint_resolved'; id: string }
   | { type: 'replay_updated'; replay: ReplayStatus }
   | { type: 'rules_updated' }
+  | { type: 'sse_rules_updated' }
   | { type: 'tapes_updated' }

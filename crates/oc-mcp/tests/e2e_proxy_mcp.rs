@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 async fn spawn_fake_upstream() -> String {
+    let (sse_push_tx, sse_push_rx) = tokio::sync::broadcast::channel::<String>(64);
     let app = Router::new()
         .route(
             "/global/health",
@@ -42,33 +43,57 @@ async fn spawn_fake_upstream() -> String {
             "/echo-large",
             post(|body: Bytes| async move { body }),
         )
+        .route(
+            "/emit-upstream-sse",
+            post({
+                let tx = sse_push_tx.clone();
+                move |Json(ev): Json<Value>| {
+                    let tx = tx.clone();
+                    async move {
+                        let _ = tx.send(ev.to_string());
+                        Json(json!({ "pushed": true }))
+                    }
+                }
+            }),
+        )
         .layer(DefaultBodyLimit::disable())
         .route(
             "/global/event",
-            get(|| async {
-                let events = vec![
-                    Ok::<SseEvent, Infallible>(SseEvent::default().data(
-                        json!({
-                            "directory": "global",
-                            "payload": { "type": "server.connected", "properties": {} }
-                        })
-                        .to_string(),
-                    )),
-                    Ok::<SseEvent, Infallible>(SseEvent::default().data(
-                        json!({
-                            "directory": "/repo/live",
-                            "payload": {
-                                "type": "session.status",
-                                "properties": { "sessionID": "ses_real_1", "status": { "type": "busy" } }
-                            }
-                        })
-                        .to_string(),
-                    )),
-                ];
-                let stream = futures_util::stream::iter(events).chain(futures_util::stream::pending());
-                Sse::new(stream)
+            get({
+                let tx = sse_push_tx.clone();
+                move || {
+                    let rx = tx.subscribe();
+                    async move {
+                        let events = vec![
+                            Ok::<SseEvent, Infallible>(SseEvent::default().data(
+                                json!({
+                                    "directory": "global",
+                                    "payload": { "type": "server.connected", "properties": {} }
+                                })
+                                .to_string(),
+                            )),
+                            Ok::<SseEvent, Infallible>(SseEvent::default().data(
+                                json!({
+                                    "directory": "/repo/live",
+                                    "payload": {
+                                        "type": "session.status",
+                                        "properties": { "sessionID": "ses_real_1", "status": { "type": "busy" } }
+                                    }
+                                })
+                                .to_string(),
+                            )),
+                        ];
+                        let live_stream = tokio_stream::wrappers::BroadcastStream::new(rx)
+                            .filter_map(|res| async move {
+                                res.ok().map(|s| Ok::<SseEvent, Infallible>(SseEvent::default().data(s)))
+                            });
+                        let stream = futures_util::stream::iter(events).chain(live_stream);
+                        Sse::new(stream)
+                    }
+                }
             }),
         );
+    drop(sse_push_rx);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -162,7 +187,7 @@ async fn end_to_end_proxy_mock_breakpoint_replay_and_mcp() {
         .unwrap();
     assert_eq!(faked["branch"], "main");
 
-    // 3. Direct Mock Rule + JSON Patch Rule
+    // 3. Direct Mock Rule + Manual Rule Update + Passthrough vs Intercept Mode Distinction
     let created_rule: MockRule = client
         .post(format!("{control_base}/api/rules"))
         .json(&json!({
@@ -179,6 +204,17 @@ async fn end_to_end_proxy_mock_breakpoint_replay_and_mcp() {
         .json()
         .await
         .unwrap();
+    // Creating an enabled rule auto-switches mode from Passthrough -> Intercept
+    let st_after_rule: ProxyRuntimeStatus = client
+        .get(format!("{control_base}/api/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(st_after_rule.mode, ProxyMode::Intercept);
+
     let vcs: Value = client
         .get(format!("{proxy_base}/vcs"))
         .send()
@@ -188,11 +224,331 @@ async fn end_to_end_proxy_mock_breakpoint_replay_and_mcp() {
         .await
         .unwrap();
     assert_eq!(vcs["branch"], "feat/mocked-branch");
+
+    // Manual update of existing rule via PUT /api/rules/{id}
+    client
+        .put(format!("{control_base}/api/rules/{}", created_rule.id))
+        .json(&json!({
+            "name": "Mock VCS Edited",
+            "method": "GET",
+            "path_pattern": "/vcs",
+            "action_type": "direct",
+            "status": 200,
+            "body": { "branch": "feat/manually-edited" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let vcs_edited: Value = client
+        .get(format!("{proxy_base}/vcs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(vcs_edited["branch"], "feat/manually-edited");
+
+    // Switching to Passthrough mode bypasses active rules cleanly without deleting them
+    client
+        .post(format!("{control_base}/api/mode"))
+        .json(&json!({ "mode": "passthrough" }))
+        .send()
+        .await
+        .unwrap();
+    let passthrough_vcs_resp = client
+        .get(format!("{proxy_base}/vcs"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(passthrough_vcs_resp.status(), 404); // Fake upstream has no /vcs route!
+
+    // Switching back to Intercept re-enables the rule immediately
+    client
+        .post(format!("{control_base}/api/mode"))
+        .json(&json!({ "mode": "intercept" }))
+        .send()
+        .await
+        .unwrap();
+    let vcs_reintercepted: Value = client
+        .get(format!("{proxy_base}/vcs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(vcs_reintercepted["branch"], "feat/manually-edited");
+
     client
         .delete(format!("{control_base}/api/rules/{}", created_rule.id))
         .send()
         .await
         .unwrap();
+
+    // 3b. HTTP Mock with Linked SSE Hub Sequence + Response-Phase Breakpoint + SSE Stream Interception
+    let linked_rule: MockRule = client
+        .post(format!("{control_base}/api/rules"))
+        .json(&json!({
+            "name": "Prompt triggers SSE sequence",
+            "method": "POST",
+            "path_pattern": "/session/:sessionID/message",
+            "action_type": "direct",
+            "status": 200,
+            "body": { "accepted": true, "session": "{{session_id}}" },
+            "sse_sequence": [
+                {
+                    "delay_ms": 20,
+                    "apply_to_shadow": true,
+                    "payload": {
+                        "type": "todo.updated",
+                        "properties": {
+                            "sessionID": "{{session_id}}",
+                            "todos": [{ "id": "td_linked", "content": "Triggered from HTTP mock", "status": "in_progress", "priority": "high" }]
+                        }
+                    }
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let prompt_resp: Value = client
+        .post(format!("{proxy_base}/session/ses_linked_77/message?directory=/repo/live"))
+        .json(&json!({ "text": "hi" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prompt_resp["session"], "ses_linked_77");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let linked_sse: Vec<SseRecord> = client
+        .get(format!("{control_base}/api/sse?session_id=ses_linked_77"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(linked_sse.len(), 1);
+    assert_eq!(linked_sse[0].event_type, "todo.updated");
+    assert!(linked_sse[0].mocked);
+    client
+        .delete(format!("{control_base}/api/rules/{}", linked_rule.id))
+        .send()
+        .await
+        .unwrap();
+
+    // Response-stage HTTP Breakpoint: intercepts REAL upstream response and edits it before client receives it
+    let res_bp_rule: MockRule = client
+        .post(format!("{control_base}/api/rules"))
+        .json(&json!({
+            "name": "Response BP Health",
+            "method": "GET",
+            "path_pattern": "/global/health",
+            "action_type": "breakpoint",
+            "breakpoint_phase": "response",
+            "one_shot": true,
+            "priority": 1
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let client_res_bp = client.clone();
+    let proxy_base_res_bp = proxy_base.clone();
+    let res_inflight = tokio::spawn(async move {
+        client_res_bp
+            .get(format!("{proxy_base_res_bp}/global/health"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let res_bps: Vec<PendingBreakpoint> = client
+        .get(format!("{control_base}/api/breakpoints"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(res_bps.len(), 1);
+    assert_eq!(res_bps[0].kind, BreakpointKind::HttpResponse);
+    assert!(res_bps[0]
+        .res_body
+        .as_deref()
+        .unwrap_or("")
+        .contains("1.2.3-upstream"));
+
+    client
+        .post(format!("{control_base}/api/breakpoints/{}/resolve", res_bps[0].id))
+        .json(&json!({
+            "decision": "respond",
+            "status": 200,
+            "headers": { "content-type": "application/json" },
+            "body": r#"{"healthy":true,"version":"edited-real-upstream-response"}"#
+        }))
+        .send()
+        .await
+        .unwrap();
+    let edited_res = res_inflight.await.unwrap();
+    assert_eq!(edited_res["version"], "edited-real-upstream-response");
+    let _ = client
+        .delete(format!("{control_base}/api/rules/{}", res_bp_rule.id))
+        .send()
+        .await;
+
+    // Live Upstream SSE Patch Rule + Live SSE Breakpoint
+    let sse_patch_rule: SseMockRule = client
+        .post(format!("{control_base}/api/sse-rules"))
+        .json(&json!({
+            "name": "Patch permission command",
+            "event_type_pattern": "permission.*",
+            "payload_contains": "dangerous",
+            "action_type": "patch",
+            "one_shot": true,
+            "patch": {
+                "properties": { "patterns": ["safe-patched-cmd"] }
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    client
+        .post(format!("{upstream}/emit-upstream-sse"))
+        .json(&json!({
+            "directory": "/repo/live",
+            "payload": {
+                "type": "permission.asked",
+                "properties": {
+                    "id": "perm_live_1",
+                    "sessionID": "ses_sse_test",
+                    "permission": "bash",
+                    "patterns": ["dangerous-cmd"]
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let patched_sse_list: Vec<SseRecord> = client
+        .get(format!("{control_base}/api/sse?session_id=ses_sse_test"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(patched_sse_list.len(), 1);
+    assert_eq!(
+        patched_sse_list[0].payload["properties"]["patterns"][0],
+        "safe-patched-cmd"
+    );
+    assert!(patched_sse_list[0].mocked);
+    let _ = client
+        .delete(format!("{control_base}/api/sse-rules/{}", sse_patch_rule.id))
+        .send()
+        .await;
+
+    // Live SSE Breakpoint: suspend upstream SSE frame, edit JSON manually, and forward
+    let sse_bp_rule: SseMockRule = client
+        .post(format!("{control_base}/api/sse-rules"))
+        .json(&json!({
+            "name": "BP on question.asked",
+            "event_type_pattern": "question.asked",
+            "action_type": "breakpoint",
+            "one_shot": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    client
+        .post(format!("{upstream}/emit-upstream-sse"))
+        .json(&json!({
+            "directory": "/repo/live",
+            "payload": {
+                "type": "question.asked",
+                "properties": {
+                    "id": "q_live_1",
+                    "sessionID": "ses_sse_bp",
+                    "header": "Original Question"
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let sse_bps: Vec<PendingBreakpoint> = client
+        .get(format!("{control_base}/api/breakpoints"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(sse_bps.len(), 1);
+    assert_eq!(sse_bps[0].kind, BreakpointKind::SseEvent);
+    client
+        .post(format!("{control_base}/api/breakpoints/{}/resolve", sse_bps[0].id))
+        .json(&json!({
+            "decision": "emit_sse",
+            "payload": {
+                "type": "question.asked",
+                "properties": {
+                    "id": "q_live_1",
+                    "sessionID": "ses_sse_bp",
+                    "header": "Manually Edited SSE Question"
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let bp_sse_records: Vec<SseRecord> = client
+        .get(format!("{control_base}/api/sse?session_id=ses_sse_bp"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bp_sse_records.len(), 1);
+    assert_eq!(
+        bp_sse_records[0].payload["properties"]["header"],
+        "Manually Edited SSE Question"
+    );
+    let _ = client
+        .delete(format!("{control_base}/api/sse-rules/{}", sse_bp_rule.id))
+        .send()
+        .await;
 
     // 4. Breakpoint suspend & resolve with custom response
     let bp_rule: MockRule = client

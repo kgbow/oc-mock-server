@@ -9,11 +9,11 @@
   - **Decoupled SSE Hub** supporting both `GET /global/event` (Web/Desktop App) and `GET /event` (TUI `opencode attach`), with **independent 9s `server.heartbeat`** keepalive so paused/stepped replays never trip OpenCode's 15s client watchdog.
   - **PTY WebSocket Bridge** for `GET /pty/:ptyID/connect`.
 - **Browser DevTools-Style Embedded Web Console** (single Rust binary via `rust-embed`):
-  - **Network**: Live HTTP table, JSON formatter, headers inspector, cURL copy, 1-click Save as Mock, and AI Chaos Mutation.
-  - **SSE Stream**: Live timeline with **Delta Folding**, filtering, mute upstream toggle, and OpenAPI-driven **SSE Event Injector**.
-  - **Mock & Breakpoints**: Priority-ordered `direct` mocks (with artificial latency), `patch` (JSON Merge Patch on live upstream responses), and live `breakpoint` request suspension/editing.
-  - **OpenAPI `/doc` + LLM Scenario Studio**: Syncs OpenCode's live `/doc` (both REST schemas and `BusEvent.payloads()`), runs deterministic Schema Faker offline, and generates schema-validated HTTP mocks or full multi-frame SSE Replay Tapes via any OpenAI-compatible LLM (with automatic `jsonschema` + sequence-invariant self-repair).
-  - **Replay & Shadow Store**: Portable `.tape.jsonl` recording/import/export, automatic **Directory Remap**, hybrid virtual session mounting into `GET /session*`, Play/Pause/Step/Speed/Seek controls, `tui.session.select` auto-navigation for TUI, and direct session URLs for Web App.
+  - **Network**: Live HTTP table, JSON formatter, headers inspector, cURL copy, full manual **Edit & Mock** studio (status, headers, JSON body, `:param` / `*` / `regex:` matchers, HTTP-triggered SSE sequences), and AI Chaos Mutation directly into the manual editor.
+  - **SSE Stream**: Live timeline with **Delta Folding**, filtering, mute upstream toggle, **Manual Edit & Re-emit** on any captured frame, and dynamic **SSE Stream Rules** (`drop`, `patch`, `replace`, `delay`, `breakpoint`).
+  - **Mock & Dynamic Breakpoints**: Priority-ordered HTTP (`direct`, `patch`, `sse_stream`, `breakpoint`) and SSE (`drop`, `patch`, `replace`, `delay`, `breakpoint`) rules with full manual editing, `one_shot` auto-disable, live **Request / Response / SSE Frame Breakpoints**, and real `Passthrough` (bypass all rules) vs `Intercept` mode separation.
+  - **OpenAPI `/doc` + LLM Scenario Studio**: Syncs OpenCode's live `/doc` (both REST schemas and `BusEvent.payloads()`), runs deterministic Schema Faker offline, and generates editable schema-validated HTTP mocks or full multi-frame SSE Replay Tapes via any OpenAI-compatible LLM.
+  - **Replay, Tape Editor & Shadow Store**: Portable `.tape.jsonl` recording/import/export, visual **Tape SSE Frame Editor** (insert, reorder, duplicate, delete, and manually edit individual event frames & offsets), automatic **Directory Remap**, hybrid virtual session mounting into `GET /session*`, Play/Pause/Step/Speed/Seek controls, `tui.session.select` auto-navigation for TUI, and direct session URLs for Web App.
 - **MCP + CLI Diagnostics for AI Agents**:
   - **Streamable HTTP MCP** built into `http://127.0.0.1:4098/mcp` + **stdio MCP** (`oc-mock-server mcp`).
   - **Server-Side Delta Folding** reduces AI agent token consumption by >95%.
@@ -102,7 +102,8 @@ Add to your `opencode.json`:
 | `get_http_detail` | Full HTTP headers & paginated body inspection (`max_body_chars` + `body_offset`) |
 | `get_sse_range` | Inspect SSE events by sequence range (`fold_deltas` toggle) |
 | `reconstruct_state_at` | Rebuild client ShadowStore snapshot (`Session/Messages/Parts/Todos/Diffs`) at any `seq` |
-| `create_mock_rule` | Dynamically create `direct` / `patch` / `breakpoint` rules |
+| `create_mock_rule` | Dynamically create HTTP `direct` / `patch` / `sse_stream` / `breakpoint` (`request`/`response`/`both`) rules with optional triggered SSE sequences |
+| `create_sse_mock_rule` | Dynamically create live SSE stream `drop` / `patch` / `replace` / `delay` / `breakpoint` rules |
 | `inject_sse_event` | Push synthetic OpenCode SSE events directly to connected clients |
 | `control_replay` | Load, play, pause, stop, step, seek, or trigger `tui.session.select` |
 
@@ -125,6 +126,8 @@ oc-mock-server tape extract ses_xxx --name "Bug repro"
 oc-mock-server tape export tape_demo_heartbeat -o demo.tape.jsonl
 oc-mock-server tape import demo.tape.jsonl
 oc-mock-server rules add --name "Fail VCS" --method GET --path /vcs --status 500 --body '{"error":"boom"}'
+oc-mock-server rules add --name "Edit Health Resp" --method GET --path /global/health --action-type breakpoint --phase response --one-shot
+oc-mock-server sse-rules add --name "Drop Idle" --event-type session.idle --action-type drop --one-shot
 ```
 
 ---

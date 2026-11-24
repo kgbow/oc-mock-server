@@ -375,19 +375,46 @@ pub fn tool_definitions() -> Value {
         },
         {
             "name": "create_mock_rule",
-            "description": "Create an HTTP mock, JSON response patch, or breakpoint rule on the proxy to reproduce or test scenarios.",
+            "description": "Create an HTTP mock, JSON response patch, SSE stream, or dynamic request/response breakpoint rule (with optional HTTP-triggered SSE sequence).",
             "inputSchema": {
                 "type": "object",
                 "required": ["name", "path_pattern"],
                 "properties": {
                     "name": { "type": "string" },
                     "method": { "type": "string", "default": "GET" },
-                    "path_pattern": { "type": "string", "description": "Path pattern supporting :param and * wildcards" },
-                    "action_type": { "type": "string", "enum": ["direct", "patch", "breakpoint"], "default": "direct" },
+                    "path_pattern": { "type": "string", "description": "Path pattern supporting :param, *, and regex:<expr>" },
+                    "query_pattern": { "type": "string" },
+                    "body_contains": { "type": "string" },
+                    "directory_filter": { "type": "string" },
+                    "action_type": { "type": "string", "enum": ["direct", "patch", "breakpoint", "sse_stream"], "default": "direct" },
+                    "breakpoint_phase": { "type": "string", "enum": ["request", "response", "both"], "default": "request" },
+                    "one_shot": { "type": "boolean", "default": false },
                     "status": { "type": "integer", "default": 200 },
                     "delay_ms": { "type": "integer", "default": 0 },
+                    "headers": { "type": "object" },
                     "body": { "description": "JSON response body for direct mocks" },
-                    "patch": { "description": "JSON merge patch object for patch rules" }
+                    "patch": { "description": "JSON merge patch object for patch rules" },
+                    "sse_sequence": { "type": "array", "description": "Optional timed SSE events triggered on HTTP match" }
+                }
+            }
+        },
+        {
+            "name": "create_sse_mock_rule",
+            "description": "Create a dynamic SSE stream interception rule to drop, JSON-patch, replace, delay, or breakpoint matching live OpenCode SSE events.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["name", "event_type_pattern"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "event_type_pattern": { "type": "string", "description": "Exact event type, wildcard (e.g. message.part.*), or regex:<expr>" },
+                    "session_filter": { "type": "string" },
+                    "directory_filter": { "type": "string" },
+                    "payload_contains": { "type": "string" },
+                    "action_type": { "type": "string", "enum": ["drop", "patch", "replace", "delay", "breakpoint"], "default": "patch" },
+                    "delay_ms": { "type": "integer", "default": 0 },
+                    "patch": { "description": "JSON merge patch applied to SSE payload" },
+                    "replace_events": { "type": "array", "description": "Replacement SSE steps when action_type=replace" },
+                    "one_shot": { "type": "boolean", "default": false }
                 }
             }
         },
@@ -553,6 +580,16 @@ async fn call_tool(backend: &McpBackend, name: &str, args: Value) -> Result<Valu
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("missing path_pattern"))?
                 .to_string();
+            let headers: BTreeMap<String, String> = args
+                .get("headers")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let sse_sequence: Vec<MockSseStep> = args
+                .get("sse_sequence")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
             let rule = MockRule {
                 id: format!("rule_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]),
                 name,
@@ -564,22 +601,95 @@ async fn call_tool(backend: &McpBackend, name: &str, args: Value) -> Result<Valu
                     .unwrap_or("GET")
                     .to_uppercase(),
                 path_pattern,
-                directory_filter: None,
+                query_pattern: args
+                    .get("query_pattern")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                body_contains: args
+                    .get("body_contains")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                directory_filter: args
+                    .get("directory_filter")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
                 action_type: MockActionType::parse(
                     args.get("action_type")
                         .and_then(Value::as_str)
                         .unwrap_or("direct"),
                 ),
+                breakpoint_phase: BreakpointPhase::parse(
+                    args.get("breakpoint_phase")
+                        .and_then(Value::as_str)
+                        .unwrap_or("request"),
+                ),
+                one_shot: args.get("one_shot").and_then(Value::as_bool).unwrap_or(false),
+                hit_count: 0,
                 status: args.get("status").and_then(Value::as_u64).unwrap_or(200) as u16,
                 delay_ms: args.get("delay_ms").and_then(Value::as_u64).unwrap_or(0),
-                headers: BTreeMap::new(),
+                headers,
                 body: args.get("body").cloned(),
                 patch: args.get("patch").cloned(),
+                sse_sequence,
                 created_at: now_ms(),
             };
             storage.upsert_mock_rule(&rule)?;
             if let McpBackend::Live(state) = backend {
+                state.ensure_intercept_if_passthrough();
                 state.broadcast(ControlWsEvent::RulesUpdated);
+            }
+            Ok(serde_json::to_value(rule)?)
+        }
+        "create_sse_mock_rule" => {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("missing name"))?
+                .to_string();
+            let event_type_pattern = args
+                .get("event_type_pattern")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("missing event_type_pattern"))?
+                .to_string();
+            let replace_events: Vec<MockSseStep> = args
+                .get("replace_events")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let rule = SseMockRule {
+                id: format!("sserule_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]),
+                name,
+                enabled: true,
+                priority: 50,
+                event_type_pattern,
+                session_filter: args
+                    .get("session_filter")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                directory_filter: args
+                    .get("directory_filter")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                payload_contains: args
+                    .get("payload_contains")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                action_type: SseMockActionType::parse(
+                    args.get("action_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("patch"),
+                ),
+                delay_ms: args.get("delay_ms").and_then(Value::as_u64).unwrap_or(0),
+                patch: args.get("patch").cloned(),
+                replace_events,
+                one_shot: args.get("one_shot").and_then(Value::as_bool).unwrap_or(false),
+                hit_count: 0,
+                created_at: now_ms(),
+            };
+            storage.upsert_sse_mock_rule(&rule)?;
+            if let McpBackend::Live(state) = backend {
+                state.ensure_intercept_if_passthrough();
+                state.broadcast(ControlWsEvent::SseRulesUpdated);
             }
             Ok(serde_json::to_value(rule)?)
         }

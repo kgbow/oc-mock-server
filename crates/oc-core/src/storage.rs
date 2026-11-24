@@ -69,7 +69,10 @@ impl Storage {
                 session_id TEXT,
                 message_id TEXT,
                 part_id TEXT,
-                payload_json TEXT NOT NULL
+                payload_json TEXT NOT NULL,
+                mocked INTEGER NOT NULL DEFAULT 0,
+                mock_rule_id TEXT,
+                dropped INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_sse_ts ON sse_events(ts);
             CREATE INDEX IF NOT EXISTS idx_sse_session ON sse_events(session_id, seq);
@@ -91,13 +94,37 @@ impl Storage {
                 priority INTEGER NOT NULL DEFAULT 100,
                 method TEXT NOT NULL,
                 path_pattern TEXT NOT NULL,
+                query_pattern TEXT,
+                body_contains TEXT,
                 directory_filter TEXT,
                 action_type TEXT NOT NULL,
+                breakpoint_phase TEXT NOT NULL DEFAULT 'request',
+                one_shot INTEGER NOT NULL DEFAULT 0,
+                hit_count INTEGER NOT NULL DEFAULT 0,
                 status INTEGER NOT NULL DEFAULT 200,
                 delay_ms INTEGER NOT NULL DEFAULT 0,
                 headers_json TEXT NOT NULL DEFAULT '{}',
                 body_json TEXT,
                 patch_json TEXT,
+                sse_sequence_json TEXT NOT NULL DEFAULT '[]',
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sse_mock_rules (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 100,
+                event_type_pattern TEXT NOT NULL,
+                session_filter TEXT,
+                directory_filter TEXT,
+                payload_contains TEXT,
+                action_type TEXT NOT NULL,
+                delay_ms INTEGER NOT NULL DEFAULT 0,
+                patch_json TEXT,
+                replace_events_json TEXT NOT NULL DEFAULT '[]',
+                one_shot INTEGER NOT NULL DEFAULT 0,
+                hit_count INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
 
@@ -118,6 +145,21 @@ impl Storage {
             );
             "#,
         )?;
+
+        // Idempotent schema migrations for pre-existing databases
+        for alter in [
+            "ALTER TABLE sse_events ADD COLUMN mocked INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE sse_events ADD COLUMN mock_rule_id TEXT",
+            "ALTER TABLE sse_events ADD COLUMN dropped INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE mock_rules ADD COLUMN query_pattern TEXT",
+            "ALTER TABLE mock_rules ADD COLUMN body_contains TEXT",
+            "ALTER TABLE mock_rules ADD COLUMN breakpoint_phase TEXT NOT NULL DEFAULT 'request'",
+            "ALTER TABLE mock_rules ADD COLUMN one_shot INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE mock_rules ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE mock_rules ADD COLUMN sse_sequence_json TEXT NOT NULL DEFAULT '[]'",
+        ] {
+            let _ = conn.execute(alter, []);
+        }
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -243,6 +285,20 @@ impl Storage {
         directory: &str,
         payload: &Value,
     ) -> Result<SseRecord> {
+        self.insert_sse_event_with_meta(ts, source, directory, payload, false, None, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_sse_event_with_meta(
+        &self,
+        ts: i64,
+        source: SseSource,
+        directory: &str,
+        payload: &Value,
+        mocked: bool,
+        mock_rule_id: Option<String>,
+        dropped: bool,
+    ) -> Result<SseRecord> {
         let event_type = payload
             .get("type")
             .and_then(Value::as_str)
@@ -254,8 +310,9 @@ impl Storage {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             r#"INSERT INTO sse_events (
-                ts, source, directory, event_type, session_id, message_id, part_id, payload_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                ts, source, directory, event_type, session_id, message_id, part_id, payload_json,
+                mocked, mock_rule_id, dropped
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
             params![
                 ts,
                 source.as_str(),
@@ -265,6 +322,9 @@ impl Storage {
                 message_id,
                 part_id,
                 payload_json,
+                mocked as i64,
+                mock_rule_id,
+                dropped as i64,
             ],
         )?;
         let seq = conn.last_insert_rowid();
@@ -294,6 +354,9 @@ impl Storage {
             message_id,
             part_id,
             payload: payload.clone(),
+            mocked,
+            mock_rule_id,
+            dropped,
         })
     }
 
@@ -492,7 +555,8 @@ impl Storage {
     ) -> Result<Vec<SseRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut sql = String::from(
-            r#"SELECT seq, ts, source, directory, event_type, session_id, message_id, part_id, payload_json
+            r#"SELECT seq, ts, source, directory, event_type, session_id, message_id, part_id, payload_json,
+                      mocked, mock_rule_id, dropped
                FROM sse_events WHERE 1=1"#,
         );
         let mut dyn_params: Vec<rusqlite::types::Value> = Vec::new();
@@ -547,6 +611,9 @@ impl Storage {
                 message_id: row.get(6)?,
                 part_id: row.get(7)?,
                 payload: serde_json::from_str(&raw).unwrap_or(Value::Null),
+                mocked: row.get::<_, i64>(9).unwrap_or(0) != 0,
+                mock_rule_id: row.get(10).unwrap_or(None),
+                dropped: row.get::<_, i64>(11).unwrap_or(0) != 0,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -564,7 +631,7 @@ impl Storage {
         let mut sql = String::from(
             r#"SELECT directory, payload_json
                FROM sse_events
-               WHERE session_id = ? AND event_type != 'server.heartbeat'"#,
+               WHERE session_id = ? AND event_type != 'server.heartbeat' AND dropped = 0"#,
         );
         let mut dyn_params: Vec<rusqlite::types::Value> = vec![session_id.to_string().into()];
         if let Some(ts) = at_seq {
@@ -909,15 +976,18 @@ impl Storage {
     pub fn list_mock_rules(&self) -> Result<Vec<MockRule>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            r#"SELECT id, name, enabled, priority, method, path_pattern, directory_filter,
-                      action_type, status, delay_ms, headers_json, body_json, patch_json, created_at
+            r#"SELECT id, name, enabled, priority, method, path_pattern, query_pattern, body_contains,
+                      directory_filter, action_type, breakpoint_phase, one_shot, hit_count,
+                      status, delay_ms, headers_json, body_json, patch_json, sse_sequence_json, created_at
                FROM mock_rules ORDER BY priority ASC, created_at DESC"#,
         )?;
         let rows = stmt.query_map([], |r| {
-            let action_str: String = r.get(7)?;
-            let headers_str: String = r.get(10)?;
-            let body_str: Option<String> = r.get(11)?;
-            let patch_str: Option<String> = r.get(12)?;
+            let action_str: String = r.get(9)?;
+            let phase_str: String = r.get::<_, Option<String>>(10)?.unwrap_or_else(|| "request".into());
+            let headers_str: String = r.get(15)?;
+            let body_str: Option<String> = r.get(16)?;
+            let patch_str: Option<String> = r.get(17)?;
+            let sse_seq_str: String = r.get::<_, Option<String>>(18)?.unwrap_or_else(|| "[]".into());
             Ok(MockRule {
                 id: r.get(0)?,
                 name: r.get(1)?,
@@ -925,18 +995,28 @@ impl Storage {
                 priority: r.get(3)?,
                 method: r.get(4)?,
                 path_pattern: r.get(5)?,
-                directory_filter: r.get(6)?,
+                query_pattern: r.get(6)?,
+                body_contains: r.get(7)?,
+                directory_filter: r.get(8)?,
                 action_type: MockActionType::parse(&action_str),
-                status: r.get::<_, i64>(8)? as u16,
-                delay_ms: r.get::<_, i64>(9)? as u64,
+                breakpoint_phase: BreakpointPhase::parse(&phase_str),
+                one_shot: r.get::<_, i64>(11).unwrap_or(0) != 0,
+                hit_count: r.get::<_, i64>(12).unwrap_or(0).max(0) as u64,
+                status: r.get::<_, i64>(13)? as u16,
+                delay_ms: r.get::<_, i64>(14)? as u64,
                 headers: serde_json::from_str(&headers_str).unwrap_or_default(),
                 body: body_str.and_then(|s| serde_json::from_str(&s).ok()),
                 patch: patch_str.and_then(|s| serde_json::from_str(&s).ok()),
-                created_at: r.get(13)?,
+                sse_sequence: serde_json::from_str(&sse_seq_str).unwrap_or_default(),
+                created_at: r.get(19)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub fn get_mock_rule(&self, id: &str) -> Result<Option<MockRule>> {
+        Ok(self.list_mock_rules()?.into_iter().find(|r| r.id == id))
     }
 
     pub fn upsert_mock_rule(&self, rule: &MockRule) -> Result<()> {
@@ -952,11 +1032,13 @@ impl Storage {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let sse_sequence_json = serde_json::to_string(&rule.sse_sequence)?;
         conn.execute(
             r#"INSERT OR REPLACE INTO mock_rules (
-                id, name, enabled, priority, method, path_pattern, directory_filter,
-                action_type, status, delay_ms, headers_json, body_json, patch_json, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"#,
+                id, name, enabled, priority, method, path_pattern, query_pattern, body_contains,
+                directory_filter, action_type, breakpoint_phase, one_shot, hit_count,
+                status, delay_ms, headers_json, body_json, patch_json, sse_sequence_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"#,
             params![
                 rule.id,
                 rule.name,
@@ -964,13 +1046,19 @@ impl Storage {
                 rule.priority,
                 rule.method,
                 rule.path_pattern,
+                rule.query_pattern,
+                rule.body_contains,
                 rule.directory_filter,
                 rule.action_type.as_str(),
+                rule.breakpoint_phase.as_str(),
+                rule.one_shot as i64,
+                rule.hit_count as i64,
                 rule.status as i64,
                 rule.delay_ms as i64,
                 headers_json,
                 body_json,
                 patch_json,
+                sse_sequence_json,
                 rule.created_at,
             ],
         )?;
@@ -983,25 +1071,210 @@ impl Storage {
         Ok(affected > 0)
     }
 
+    /// Increment `hit_count` and, if `one_shot` is true, automatically set `enabled = 0`.
+    /// Returns `true` if `enabled` changed (so caller can broadcast `RulesUpdated`).
+    pub fn record_mock_rule_hit(&self, id: &str, one_shot: bool) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        if one_shot {
+            conn.execute(
+                "UPDATE mock_rules SET hit_count = hit_count + 1, enabled = 0 WHERE id = ?1",
+                params![id],
+            )?;
+            Ok(true)
+        } else {
+            conn.execute(
+                "UPDATE mock_rules SET hit_count = hit_count + 1 WHERE id = ?1",
+                params![id],
+            )?;
+            Ok(false)
+        }
+    }
+
+    pub fn has_body_dependent_rule(
+        &self,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        directory: Option<&str>,
+    ) -> Result<bool> {
+        let rules = self.list_mock_rules()?;
+        for rule in rules {
+            if !rule.enabled {
+                continue;
+            }
+            if !rule_matches_head(&rule, method, path, query, directory) {
+                continue;
+            }
+            if rule.body_contains.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn find_matching_rule(
         &self,
         method: &str,
         path: &str,
         directory: Option<&str>,
     ) -> Result<Option<MockRule>> {
+        self.find_matching_rule_ext(method, path, None, directory, None)
+    }
+
+    pub fn find_matching_rule_ext(
+        &self,
+        method: &str,
+        path: &str,
+        query: Option<&str>,
+        directory: Option<&str>,
+        req_body: Option<&str>,
+    ) -> Result<Option<MockRule>> {
         let rules = self.list_mock_rules()?;
         for rule in rules {
             if !rule.enabled {
                 continue;
             }
-            if rule.method != "ANY" && !rule.method.eq_ignore_ascii_case(method) {
+            if !rule_matches_head(&rule, method, path, query, directory) {
                 continue;
             }
-            if !path_matches(&rule.path_pattern, path) {
+            if let Some(body_pat) = rule.body_contains.as_deref() {
+                if !body_pat.trim().is_empty() {
+                    let actual = req_body.unwrap_or("");
+                    if !substring_or_regex_matches(body_pat, actual) {
+                        continue;
+                    }
+                }
+            }
+            return Ok(Some(rule));
+        }
+        Ok(None)
+    }
+
+    // ---- SSE Mock Rules ----
+
+    pub fn list_sse_mock_rules(&self) -> Result<Vec<SseMockRule>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"SELECT id, name, enabled, priority, event_type_pattern, session_filter,
+                      directory_filter, payload_contains, action_type, delay_ms,
+                      patch_json, replace_events_json, one_shot, hit_count, created_at
+               FROM sse_mock_rules ORDER BY priority ASC, created_at DESC"#,
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let action_str: String = r.get(8)?;
+            let patch_str: Option<String> = r.get(10)?;
+            let replace_str: String = r.get::<_, Option<String>>(11)?.unwrap_or_else(|| "[]".into());
+            Ok(SseMockRule {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                enabled: r.get::<_, i64>(2)? != 0,
+                priority: r.get(3)?,
+                event_type_pattern: r.get(4)?,
+                session_filter: r.get(5)?,
+                directory_filter: r.get(6)?,
+                payload_contains: r.get(7)?,
+                action_type: SseMockActionType::parse(&action_str),
+                delay_ms: r.get::<_, i64>(9)? as u64,
+                patch: patch_str.and_then(|s| serde_json::from_str(&s).ok()),
+                replace_events: serde_json::from_str(&replace_str).unwrap_or_default(),
+                one_shot: r.get::<_, i64>(12).unwrap_or(0) != 0,
+                hit_count: r.get::<_, i64>(13).unwrap_or(0).max(0) as u64,
+                created_at: r.get(14)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_sse_mock_rule(&self, id: &str) -> Result<Option<SseMockRule>> {
+        Ok(self.list_sse_mock_rules()?.into_iter().find(|r| r.id == id))
+    }
+
+    pub fn upsert_sse_mock_rule(&self, rule: &SseMockRule) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let patch_json = rule
+            .patch
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let replace_json = serde_json::to_string(&rule.replace_events)?;
+        conn.execute(
+            r#"INSERT OR REPLACE INTO sse_mock_rules (
+                id, name, enabled, priority, event_type_pattern, session_filter,
+                directory_filter, payload_contains, action_type, delay_ms,
+                patch_json, replace_events_json, one_shot, hit_count, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"#,
+            params![
+                rule.id,
+                rule.name,
+                rule.enabled as i64,
+                rule.priority,
+                rule.event_type_pattern,
+                rule.session_filter,
+                rule.directory_filter,
+                rule.payload_contains,
+                rule.action_type.as_str(),
+                rule.delay_ms as i64,
+                patch_json,
+                replace_json,
+                rule.one_shot as i64,
+                rule.hit_count as i64,
+                rule.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_sse_mock_rule(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute("DELETE FROM sse_mock_rules WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
+    }
+
+    pub fn record_sse_rule_hit(&self, id: &str, one_shot: bool) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        if one_shot {
+            conn.execute(
+                "UPDATE sse_mock_rules SET hit_count = hit_count + 1, enabled = 0 WHERE id = ?1",
+                params![id],
+            )?;
+            Ok(true)
+        } else {
+            conn.execute(
+                "UPDATE sse_mock_rules SET hit_count = hit_count + 1 WHERE id = ?1",
+                params![id],
+            )?;
+            Ok(false)
+        }
+    }
+
+    pub fn find_matching_sse_rule(
+        &self,
+        event_type: &str,
+        session_id: Option<&str>,
+        directory: &str,
+        raw_payload: &str,
+    ) -> Result<Option<SseMockRule>> {
+        let rules = self.list_sse_mock_rules()?;
+        for rule in rules {
+            if !rule.enabled {
                 continue;
             }
-            if let Some(dir_filter) = &rule.directory_filter {
-                if !dir_filter.is_empty() && directory != Some(dir_filter.as_str()) {
+            if !pattern_matches(&rule.event_type_pattern, event_type) {
+                continue;
+            }
+            if let Some(sf) = rule.session_filter.as_deref() {
+                if !sf.trim().is_empty() && !pattern_matches(sf, session_id.unwrap_or("")) {
+                    continue;
+                }
+            }
+            if let Some(df) = rule.directory_filter.as_deref() {
+                if !df.trim().is_empty() && !pattern_matches(df, directory) {
+                    continue;
+                }
+            }
+            if let Some(pc) = rule.payload_contains.as_deref() {
+                if !pc.trim().is_empty() && !substring_or_regex_matches(pc, raw_payload) {
                     continue;
                 }
             }
@@ -1135,7 +1408,11 @@ impl Storage {
 
         let tape_events: Vec<TapeEvent> = events
             .into_iter()
-            .filter(|e| e.event_type != "server.connected" && e.event_type != "server.heartbeat")
+            .filter(|e| {
+                !e.dropped
+                    && e.event_type != "server.connected"
+                    && e.event_type != "server.heartbeat"
+            })
             .map(|e| TapeEvent {
                 offset_ms: (e.ts - first_ts).max(0) as u64,
                 directory: e.directory,
@@ -1205,7 +1482,7 @@ pub fn fold_sse_events(events: Vec<SseRecord>) -> Vec<TimelineItem> {
     };
 
     for ev in events {
-        if ev.event_type == "message.part.delta" {
+        if ev.event_type == "message.part.delta" && !ev.dropped {
             let props = ev.payload.get("properties");
             let mid = props
                 .and_then(|p| p.get("messageID"))
@@ -1290,4 +1567,30 @@ pub fn truncate_str(s: &str, max_chars: usize) -> String {
     } else {
         collected
     }
+}
+
+fn rule_matches_head(
+    rule: &MockRule,
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    directory: Option<&str>,
+) -> bool {
+    if rule.method != "ANY" && !rule.method.eq_ignore_ascii_case(method) {
+        return false;
+    }
+    if !path_matches(&rule.path_pattern, path) {
+        return false;
+    }
+    if let Some(qpat) = rule.query_pattern.as_deref() {
+        if !qpat.trim().is_empty() && !substring_or_regex_matches(qpat, query.unwrap_or("")) {
+            return false;
+        }
+    }
+    if let Some(dir_filter) = rule.directory_filter.as_deref() {
+        if !dir_filter.trim().is_empty() && !pattern_matches(dir_filter, directory.unwrap_or("")) {
+            return false;
+        }
+    }
+    true
 }

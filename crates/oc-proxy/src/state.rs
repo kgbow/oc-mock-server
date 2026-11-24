@@ -156,6 +156,28 @@ impl AppState {
         self.broadcast_status();
     }
 
+    /// Rules and breakpoints are evaluated in `Intercept` and `Replay` modes,
+    /// and bypassed completely in `Passthrough` mode.
+    pub fn rules_active(&self) -> bool {
+        self.mode() != ProxyMode::Passthrough
+    }
+
+    /// Automatically transition from `Passthrough` to `Intercept` when an enabled rule is created or turned on.
+    pub fn ensure_intercept_if_passthrough(&self) {
+        let switched = {
+            let mut m = self.mode.write().unwrap();
+            if *m == ProxyMode::Passthrough {
+                *m = ProxyMode::Intercept;
+                true
+            } else {
+                false
+            }
+        };
+        if switched {
+            self.broadcast_status();
+        }
+    }
+
     pub fn is_muted(&self) -> bool {
         self.mute_upstream_sse.load(Ordering::Relaxed)
     }
@@ -205,17 +227,34 @@ impl AppState {
     /// Record (if enabled) and fan out an SSE event to all connected OpenCode clients
     /// (`/global/event` receives `{ directory, payload }`, `/event` receives `payload` filtered by directory).
     pub fn emit_sse(&self, source: SseSource, directory: &str, payload: Value) -> Option<SseRecord> {
+        self.emit_sse_with_meta(source, directory, payload, false, None, false)
+    }
+
+    pub fn emit_sse_with_meta(
+        &self,
+        source: SseSource,
+        directory: &str,
+        payload: Value,
+        mocked: bool,
+        mock_rule_id: Option<String>,
+        dropped: bool,
+    ) -> Option<SseRecord> {
         let event_type = payload
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
 
-        let recorded = if self.is_recording() || source != SseSource::Upstream {
+        let recorded = if self.is_recording() || source != SseSource::Upstream || mocked {
             if event_type != "server.heartbeat" {
-                match self
-                    .storage
-                    .insert_sse_event(now_ms(), source.clone(), directory, &payload)
-                {
+                match self.storage.insert_sse_event_with_meta(
+                    now_ms(),
+                    source.clone(),
+                    directory,
+                    &payload,
+                    mocked,
+                    mock_rule_id,
+                    dropped,
+                ) {
                     Ok(rec) => {
                         self.broadcast(ControlWsEvent::SseRecorded { event: rec.clone() });
                         Some(rec)
@@ -231,6 +270,10 @@ impl AppState {
         } else {
             None
         };
+
+        if dropped {
+            return recorded;
+        }
 
         let global_data = serde_json::to_string(&json!({
             "directory": directory,
@@ -273,6 +316,45 @@ impl AppState {
         }
 
         recorded
+    }
+
+    /// Asynchronously emit a timed sequence of mock SSE events (with template substitution and optional ShadowStore updates).
+    pub fn spawn_sse_steps(
+        self: &Arc<Self>,
+        rule_id: String,
+        steps: Vec<MockSseStep>,
+        ctx: TemplateContext,
+        source: SseSource,
+    ) {
+        if steps.is_empty() {
+            return;
+        }
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            for step in steps {
+                if step.delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(step.delay_ms)).await;
+                }
+                let payload = ctx.apply_value(&step.payload);
+                let dir = step
+                    .directory
+                    .as_deref()
+                    .filter(|d| !d.trim().is_empty())
+                    .map(|d| ctx.apply_str(d))
+                    .unwrap_or_else(|| ctx.directory.clone());
+                if step.apply_to_shadow {
+                    state.shadow.write().unwrap().apply_event(&payload);
+                }
+                state.emit_sse_with_meta(
+                    source.clone(),
+                    &dir,
+                    payload,
+                    true,
+                    Some(rule_id.clone()),
+                    false,
+                );
+            }
+        });
     }
 
     /// Push a raw control frame (such as `server.connected`) to all SSE clients without recording.

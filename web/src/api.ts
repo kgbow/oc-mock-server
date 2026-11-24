@@ -1,5 +1,7 @@
 import type {
   Anomaly,
+  CreateMockRuleInput,
+  CreateSseMockRuleInput,
   HttpTrace,
   HttpTraceSummary,
   LlmConfigView,
@@ -10,8 +12,12 @@ import type {
   ProxyRuntimeStatus,
   ReplayStatus,
   SessionOverview,
+  SseMockRule,
   SseRecord,
   SseTimelineEntry,
+  Tape,
+  TapeEvent,
+  TapeSnapshot,
   TapeSummary,
 } from './types'
 
@@ -84,21 +90,9 @@ export const api = {
   },
 
   listRules: () => req<MockRule[]>('/api/rules'),
-  createRule: (rule: {
-    name: string
-    enabled?: boolean
-    priority?: number
-    method: string
-    path_pattern: string
-    directory_filter?: string | null
-    action_type: 'direct' | 'patch' | 'breakpoint'
-    status?: number
-    delay_ms?: number
-    headers?: Record<string, string>
-    body?: unknown
-    patch?: unknown
-  }) => req<MockRule>('/api/rules', { method: 'POST', body: JSON.stringify(rule) }),
-  updateRule: (id: string, rule: Omit<MockRule, 'id' | 'created_at'>) =>
+  createRule: (rule: CreateMockRuleInput) =>
+    req<MockRule>('/api/rules', { method: 'POST', body: JSON.stringify(rule) }),
+  updateRule: (id: string, rule: CreateMockRuleInput) =>
     req<MockRule>(`/api/rules/${encodeURIComponent(id)}`, {
       method: 'PUT',
       body: JSON.stringify(rule),
@@ -106,12 +100,37 @@ export const api = {
   deleteRule: (id: string) =>
     req<{ deleted: boolean }>(`/api/rules/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
+  listSseRules: () => req<SseMockRule[]>('/api/sse-rules'),
+  createSseRule: (rule: CreateSseMockRuleInput) =>
+    req<SseMockRule>('/api/sse-rules', { method: 'POST', body: JSON.stringify(rule) }),
+  updateSseRule: (id: string, rule: CreateSseMockRuleInput) =>
+    req<SseMockRule>(`/api/sse-rules/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(rule),
+    }),
+  deleteSseRule: (id: string) =>
+    req<{ deleted: boolean }>(`/api/sse-rules/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
   listBreakpoints: () => req<PendingBreakpoint[]>('/api/breakpoints'),
   resolveBreakpoint: (
     id: string,
     decision:
-      | { decision: 'forward'; req_body?: string | null; req_headers?: Record<string, string> | null }
-      | { decision: 'respond'; status: number; headers: Record<string, string>; body: string }
+      | {
+          decision: 'forward'
+          method?: string | null
+          path?: string | null
+          query?: string | null
+          req_body?: string | null
+          req_headers?: Record<string, string> | null
+        }
+      | { decision: 'respond'; status: number; headers?: Record<string, string>; body: string }
+      | {
+          decision: 'emit_sse'
+          payload: unknown
+          directory?: string | null
+          apply_to_shadow?: boolean
+        }
+      | { decision: 'drop' }
       | { decision: 'abort'; message?: string },
   ) =>
     req<{ resolved: boolean }>(`/api/breakpoints/${encodeURIComponent(id)}/resolve`, {
@@ -120,6 +139,30 @@ export const api = {
     }),
 
   listTapes: () => req<TapeSummary[]>('/api/tapes'),
+  getTape: (id: string) => req<Tape>(`/api/tapes/${encodeURIComponent(id)}`),
+  saveTape: (tape: {
+    id?: string
+    name: string
+    description?: string | null
+    directory: string
+    session_id?: string | null
+    snapshot?: TapeSnapshot
+    events: TapeEvent[]
+    created_at?: number
+  }) =>
+    req<Tape>('/api/tapes', {
+      method: 'POST',
+      body: JSON.stringify({
+        id: tape.id ?? '',
+        name: tape.name,
+        description: tape.description ?? null,
+        directory: tape.directory,
+        session_id: tape.session_id ?? null,
+        snapshot: tape.snapshot ?? {},
+        events: tape.events,
+        created_at: tape.created_at ?? 0,
+      }),
+    }),
   extractTape: (sessionId: string, name?: string) =>
     req<TapeSummary>(`/api/tapes/extract/${encodeURIComponent(sessionId)}`, {
       method: 'POST',

@@ -157,6 +157,12 @@ enum Commands {
         #[command(subcommand)]
         action: RuleAction,
     },
+
+    /// Manage SSE stream Mock / Drop / Patch / Breakpoint rules
+    SseRules {
+        #[command(subcommand)]
+        action: SseRuleAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -187,8 +193,16 @@ enum RuleAction {
         method: String,
         #[arg(long)]
         path: String,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        body_contains: Option<String>,
         #[arg(long, default_value = "direct")]
         action_type: String,
+        #[arg(long, default_value = "request")]
+        phase: String,
+        #[arg(long)]
+        one_shot: bool,
         #[arg(long, default_value_t = 200)]
         status: u16,
         #[arg(long, default_value_t = 0)]
@@ -197,6 +211,32 @@ enum RuleAction {
         body: Option<String>,
         #[arg(long)]
         patch: Option<String>,
+    },
+    Delete {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SseRuleAction {
+    List,
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "*")]
+        event_type: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        payload_contains: Option<String>,
+        #[arg(long, default_value = "patch")]
+        action_type: String,
+        #[arg(long, default_value_t = 0)]
+        delay_ms: u64,
+        #[arg(long)]
+        patch: Option<String>,
+        #[arg(long)]
+        one_shot: bool,
     },
     Delete {
         id: String,
@@ -618,7 +658,11 @@ async fn async_main() -> Result<()> {
                     name,
                     method,
                     path,
+                    query,
+                    body_contains,
                     action_type,
+                    phase,
+                    one_shot,
                     status,
                     delay_ms,
                     body,
@@ -635,13 +679,19 @@ async fn async_main() -> Result<()> {
                         priority: 50,
                         method: method.to_uppercase(),
                         path_pattern: path,
+                        query_pattern: query,
+                        body_contains,
                         directory_filter: None,
                         action_type: MockActionType::parse(&action_type),
+                        breakpoint_phase: BreakpointPhase::parse(&phase),
+                        one_shot,
+                        hit_count: 0,
                         status,
                         delay_ms,
                         headers: BTreeMap::new(),
                         body: parsed_body,
                         patch: parsed_patch,
+                        sse_sequence: Vec::new(),
                         created_at: now_ms(),
                     };
                     storage.upsert_mock_rule(&rule)?;
@@ -653,6 +703,73 @@ async fn async_main() -> Result<()> {
                 }
                 RuleAction::Delete { id } => {
                     let deleted = storage.delete_mock_rule(&id)?;
+                    if cli.json {
+                        println!("{}", json!({ "deleted": deleted }));
+                    } else {
+                        println!("Deleted {}: {}", id, deleted);
+                    }
+                }
+            }
+        }
+
+        Commands::SseRules { action } => {
+            let storage = Storage::open(&cli.db)?;
+            match action {
+                SseRuleAction::List => {
+                    let rules = storage.list_sse_mock_rules()?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&rules)?);
+                    } else {
+                        for r in rules {
+                            println!(
+                                "{:<18} [{}] {:<10} {:<26} hits={}",
+                                r.id,
+                                if r.enabled { "ON " } else { "OFF" },
+                                r.action_type.as_str(),
+                                r.event_type_pattern,
+                                r.hit_count
+                            );
+                        }
+                    }
+                }
+                SseRuleAction::Add {
+                    name,
+                    event_type,
+                    session,
+                    payload_contains,
+                    action_type,
+                    delay_ms,
+                    patch,
+                    one_shot,
+                } => {
+                    let parsed_patch: Option<Value> =
+                        patch.map(|s| serde_json::from_str(&s)).transpose()?;
+                    let rule = SseMockRule {
+                        id: format!("sserule_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]),
+                        name,
+                        enabled: true,
+                        priority: 50,
+                        event_type_pattern: event_type,
+                        session_filter: session,
+                        directory_filter: None,
+                        payload_contains,
+                        action_type: SseMockActionType::parse(&action_type),
+                        delay_ms,
+                        patch: parsed_patch,
+                        replace_events: Vec::new(),
+                        one_shot,
+                        hit_count: 0,
+                        created_at: now_ms(),
+                    };
+                    storage.upsert_sse_mock_rule(&rule)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&rule)?);
+                    } else {
+                        println!("Created SSE mock rule {}", rule.id);
+                    }
+                }
+                SseRuleAction::Delete { id } => {
+                    let deleted = storage.delete_sse_mock_rule(&id)?;
                     if cli.json {
                         println!("{}", json!({ "deleted": deleted }));
                     } else {
