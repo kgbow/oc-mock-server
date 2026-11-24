@@ -2,22 +2,23 @@ use crate::sse::{handle_directory_event, handle_global_event};
 use crate::state::{AppState, PendingBreakpointEntry};
 use axum::body::Body;
 use axum::extract::ws::{Message as AxumWsMsg, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use futures_util::{SinkExt, StreamExt};
+use bytes::{Bytes, BytesMut};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use oc_core::*;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tower_http::cors::{Any, CorsLayer};
 
-const MAX_CAPTURE_BODY_BYTES: usize = 2 * 1024 * 1024;
+const SYNC_BUFFER_SWITCH_BYTES: usize = 64 * 1024;
 
 pub fn build_proxy_router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new()
@@ -36,6 +37,7 @@ pub fn build_proxy_router(state: Arc<AppState>) -> Router {
         .route("/event", get(handle_directory_event))
         .route("/pty/{pty_id}/connect", get(handle_pty_ws))
         .fallback(handle_http_proxy)
+        .layer(DefaultBodyLimit::disable())
         .layer(cors)
         .with_state(state)
 }
@@ -118,39 +120,253 @@ async fn bridge_pty_ws(client_ws: WebSocket, target_url: String, _auth: Option<S
     }
 }
 
+#[derive(Default)]
+struct BodyCapture {
+    total_bytes: usize,
+    captured: Vec<u8>,
+    capture_enabled: bool,
+}
+
+impl BodyCapture {
+    fn new(capture_enabled: bool) -> Self {
+        Self {
+            total_bytes: 0,
+            captured: Vec::new(),
+            capture_enabled,
+        }
+    }
+
+    fn observe_chunk(&mut self, chunk: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+        if self.capture_enabled {
+            self.captured.extend_from_slice(chunk);
+        }
+    }
+
+    fn snapshot_size_and_body(&self) -> (usize, Option<String>) {
+        let body = if !self.capture_enabled || self.captured.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&self.captured).into_owned())
+        };
+        (self.total_bytes, body)
+    }
+
+    fn into_size_and_body(self) -> (usize, Option<String>) {
+        let body = if !self.capture_enabled || self.captured.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&self.captured).into_owned())
+        };
+        (self.total_bytes, body)
+    }
+}
+
+fn full_utf8_capture(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Drain a request body stream while counting its total size and capturing its full content
+/// when `capture` is enabled, without rejecting large payloads.
+async fn drain_body_for_trace(body: Body, capture: bool) -> Result<(usize, Option<String>), String> {
+    let mut cap = BodyCapture::new(capture);
+    let mut stream = body.into_data_stream();
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.map_err(|e| e.to_string())?;
+        cap.observe_chunk(&chunk);
+    }
+    Ok(cap.into_size_and_body())
+}
+
+/// Collect full request bytes (used only when an active Breakpoint suspends the request for editing).
+async fn collect_full_body(body: Body) -> Result<Bytes, String> {
+    let mut buf = BytesMut::new();
+    let mut stream = body.into_data_stream();
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.map_err(|e| e.to_string())?;
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf.freeze())
+}
+
+enum OutgoingReqBody {
+    Empty,
+    Full(Bytes),
+    Streaming(reqwest::Body),
+}
+
+fn into_sync_stream<S, T, E>(
+    stream: S,
+) -> impl futures_util::Stream<Item = Result<T, E>> + Send + Sync + 'static
+where
+    S: futures_util::Stream<Item = Result<T, E>> + Send + 'static,
+    T: Send + 'static,
+    E: Send + 'static,
+{
+    let mutex = Mutex::new(Box::pin(stream));
+    futures_util::stream::poll_fn(move |cx| mutex.lock().unwrap().as_mut().poll_next(cx))
+}
+
+/// Stream the incoming request body to upstream while tee-capturing the full body when recording.
+async fn prepare_streaming_req_body(
+    req_body: Body,
+    req_capture: Arc<Mutex<BodyCapture>>,
+) -> Result<OutgoingReqBody, String> {
+    let mut data_stream = req_body.into_data_stream();
+    let first_chunk = loop {
+        match data_stream.next().await {
+            None => return Ok(OutgoingReqBody::Empty),
+            Some(Ok(chunk)) if chunk.is_empty() => continue,
+            Some(Ok(chunk)) => {
+                req_capture.lock().unwrap().observe_chunk(&chunk);
+                break chunk;
+            }
+            Some(Err(err)) => return Err(format!("client request body stream error: {err}")),
+        }
+    };
+
+    let mut prefix = vec![first_chunk];
+    let mut prefix_len = prefix[0].len();
+    if prefix_len < SYNC_BUFFER_SWITCH_BYTES {
+        loop {
+            match data_stream.next().now_or_never() {
+                Some(None) => {
+                    if prefix.len() == 1 {
+                        return Ok(OutgoingReqBody::Full(prefix.pop().unwrap()));
+                    }
+                    let mut combined = BytesMut::with_capacity(prefix_len);
+                    for b in prefix {
+                        combined.extend_from_slice(&b);
+                    }
+                    return Ok(OutgoingReqBody::Full(combined.freeze()));
+                }
+                Some(Some(Ok(chunk))) => {
+                    if !chunk.is_empty() {
+                        req_capture.lock().unwrap().observe_chunk(&chunk);
+                        prefix_len += chunk.len();
+                        prefix.push(chunk);
+                        if prefix_len >= SYNC_BUFFER_SWITCH_BYTES {
+                            break;
+                        }
+                    }
+                }
+                Some(Some(Err(err))) => {
+                    return Err(format!("client request body stream error: {err}"));
+                }
+                None => break,
+            }
+        }
+    }
+
+    let prefix_stream =
+        futures_util::stream::iter(prefix.into_iter().map(Ok::<Bytes, axum::Error>));
+    let cap_tail = Arc::clone(&req_capture);
+    let tail_stream = data_stream.map(move |res| {
+        if let Ok(ref chunk) = res {
+            cap_tail.lock().unwrap().observe_chunk(chunk);
+        }
+        res
+    });
+    let sync_stream = into_sync_stream(prefix_stream.chain(tail_stream));
+    Ok(OutgoingReqBody::Streaming(reqwest::Body::wrap_stream(
+        sync_stream,
+    )))
+}
+
+struct StreamTraceFinalizer {
+    state: Arc<AppState>,
+    recording: bool,
+    trace: HttpTrace,
+    req_capture: Option<Arc<Mutex<BodyCapture>>>,
+    res_capture: BodyCapture,
+    extract_session_body: bool,
+    finished: bool,
+}
+
+impl StreamTraceFinalizer {
+    fn finish(&mut self, upstream_err: Option<String>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        if let Some(ref rc) = self.req_capture {
+            let (req_sz, req_bd) = rc.lock().unwrap().snapshot_size_and_body();
+            self.trace.req_size = req_sz;
+            if self.recording {
+                self.trace.req_body = req_bd;
+            }
+        }
+
+        let completed = now_ms();
+        self.trace.completed_at = Some(completed);
+        self.trace.duration_ms = Some((completed - self.trace.started_at).max(0));
+        self.trace.res_size = self.res_capture.total_bytes;
+
+        if self.extract_session_body && self.trace.session_id.is_none() {
+            if let Ok(text) = std::str::from_utf8(&self.res_capture.captured) {
+                self.trace.session_id = extract_session_from_body(&self.trace.path, text);
+            }
+        }
+
+        if self.recording {
+            self.trace.res_body = if self.res_capture.captured.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&self.res_capture.captured).into_owned())
+            };
+        }
+        if upstream_err.is_some() {
+            self.trace.upstream_error = upstream_err;
+        }
+        self.trace.pending = false;
+
+        if self.recording {
+            let _ = self.state.storage.complete_http_trace(&self.trace);
+            self.state.broadcast(ControlWsEvent::HttpCompleted {
+                trace: trace_to_summary(&self.trace),
+            });
+        }
+    }
+}
+
+impl Drop for StreamTraceFinalizer {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(Some(
+                "downstream client disconnected before response completed".into(),
+            ));
+        }
+    }
+}
+
 async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let (parts, req_body) = req.into_parts();
     let started_at = now_ms();
     let trace_id = format!("tr_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
-    let method = req.method().clone();
-    let uri = req.uri().clone();
+    let method = parts.method;
+    let uri = parts.uri;
     let path = uri.path().to_string();
     let query = uri.query().map(ToOwned::to_owned);
-    let req_headers_map = headers_to_map(req.headers());
-    let directory = extract_directory(&query, req.headers());
+    let req_headers_map = headers_to_map(&parts.headers);
+    let directory = extract_directory(&query, &parts.headers);
     if let Some(ref d) = directory {
         state.record_directory(d);
     }
 
     let mut session_id = extract_session_from_path(&path);
-
-    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_CAPTURE_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(err) => {
-            return (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("request body exceeded capture limit: {err}"),
-            )
-                .into_response();
-        }
-    };
-
-    let req_size = body_bytes.len();
-    let mut req_body_str = if body_bytes.is_empty() {
-        None
-    } else {
-        Some(String::from_utf8_lossy(&body_bytes).into_owned())
-    };
+    let initial_req_size_hint = parts
+        .headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
     let mut eff_req_headers = req_headers_map.clone();
+    let recording = state.is_recording();
 
     let mut trace = HttpTrace {
         id: trace_id.clone(),
@@ -164,8 +380,8 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
         session_id: session_id.clone(),
         status: None,
         req_headers: req_headers_map,
-        req_body: req_body_str.clone(),
-        req_size,
+        req_body: None,
+        req_size: initial_req_size_hint,
         res_headers: BTreeMap::new(),
         res_body: None,
         res_size: 0,
@@ -175,7 +391,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
         pending: true,
     };
 
-    if state.is_recording() {
+    if recording {
         let _ = state.storage.insert_http_started(&trace);
         state.broadcast(ControlWsEvent::HttpStarted {
             trace: trace_to_summary(&trace),
@@ -190,10 +406,31 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
         .flatten();
 
     let mut patch_to_apply: Option<(String, Value)> = None;
+    let mut breakpoint_forward_body: Option<Bytes> = None;
+    let mut req_body_opt = Some(req_body);
 
     if let Some(rule) = matched_rule {
         match rule.action_type {
             MockActionType::Direct => {
+                match drain_body_for_trace(req_body_opt.take().unwrap(), recording).await {
+                    Ok((sz, bd)) => {
+                        trace.req_size = sz;
+                        trace.req_body = bd;
+                    }
+                    Err(err) => {
+                        return finalize_and_respond(
+                            &state,
+                            recording,
+                            &mut trace,
+                            400,
+                            json_headers(),
+                            serde_json::to_vec(&json!({ "error": err })).unwrap_or_default(),
+                            false,
+                            None,
+                            Some(err),
+                        );
+                    }
+                }
                 if rule.delay_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(rule.delay_ms)).await;
                 }
@@ -209,6 +446,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                 res_headers.insert("x-oc-proxy-mocked".into(), "true".into());
                 return finalize_and_respond(
                     &state,
+                    recording,
                     &mut trace,
                     rule.status,
                     res_headers,
@@ -219,6 +457,28 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                 );
             }
             MockActionType::Breakpoint => {
+                let raw_req_bytes = match collect_full_body(req_body_opt.take().unwrap()).await {
+                    Ok(b) => b,
+                    Err(err) => {
+                        return finalize_and_respond(
+                            &state,
+                            recording,
+                            &mut trace,
+                            400,
+                            json_headers(),
+                            serde_json::to_vec(&json!({ "error": err })).unwrap_or_default(),
+                            false,
+                            None,
+                            Some(err),
+                        );
+                    }
+                };
+                let bp_captured = full_utf8_capture(&raw_req_bytes);
+                trace.req_size = raw_req_bytes.len();
+                if recording {
+                    trace.req_body = bp_captured.clone();
+                }
+
                 let bp_id = format!("bp_{}", &uuid::Uuid::new_v4().simple().to_string()[..10]);
                 let (tx, rx) = oneshot::channel();
                 let bp = PendingBreakpoint {
@@ -232,7 +492,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                     query: query.clone(),
                     directory: directory.clone(),
                     req_headers: eff_req_headers.clone(),
-                    req_body: req_body_str.clone(),
+                    req_body: bp_captured.clone(),
                 };
                 state.breakpoints.insert(
                     bp_id.clone(),
@@ -261,6 +521,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                         headers.insert("x-oc-proxy-mocked".into(), "breakpoint".into());
                         return finalize_and_respond(
                             &state,
+                            recording,
                             &mut trace,
                             status,
                             headers,
@@ -271,20 +532,33 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                         );
                     }
                     Ok(Ok(BreakpointDecision::Forward {
-                        req_body,
+                        req_body: edited_body,
                         req_headers,
                     })) => {
-                        if let Some(b) = req_body {
-                            req_body_str = Some(b);
-                        }
                         if let Some(h) = req_headers {
                             eff_req_headers = h;
+                            trace.req_headers = eff_req_headers.clone();
+                        }
+                        if let Some(b) = edited_body {
+                            if Some(b.as_str()) != bp_captured.as_deref() {
+                                let edited_bytes = Bytes::from(b.into_bytes());
+                                trace.req_size = edited_bytes.len();
+                                if recording {
+                                    trace.req_body = full_utf8_capture(&edited_bytes);
+                                }
+                                breakpoint_forward_body = Some(edited_bytes);
+                            } else {
+                                breakpoint_forward_body = Some(raw_req_bytes);
+                            }
+                        } else {
+                            breakpoint_forward_body = Some(raw_req_bytes);
                         }
                     }
                     Ok(Ok(BreakpointDecision::Abort { message })) => {
                         let msg = message.unwrap_or_else(|| "aborted at breakpoint".to_string());
                         return finalize_and_respond(
                             &state,
+                            recording,
                             &mut trace,
                             502,
                             json_headers(),
@@ -296,6 +570,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                     }
                     _ => {
                         // Timed out or channel closed -> proceed with normal forward
+                        breakpoint_forward_body = Some(raw_req_bytes);
                     }
                 }
             }
@@ -319,10 +594,17 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
         if let Some(virtual_json) =
             try_serve_shadow_exact(&state, &path, is_offline || is_replay_mode)
         {
+            if let Some(body) = req_body_opt.take() {
+                if let Ok((sz, bd)) = drain_body_for_trace(body, recording).await {
+                    trace.req_size = sz;
+                    trace.req_body = bd;
+                }
+            }
             let mut headers = json_headers();
             headers.insert("x-oc-proxy-mocked".into(), "shadow".into());
             return finalize_and_respond(
                 &state,
+                recording,
                 &mut trace,
                 200,
                 headers,
@@ -336,13 +618,43 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
 
     // 3. Offline fallback when no upstream is configured
     let Some(upstream) = state.config.upstream_url.clone() else {
-        if let Some((status, val)) =
-            serve_offline_fallback(&state, &method, &path, directory.as_deref(), req_body_str.as_deref())
-        {
+        let mut offline_req_body = trace.req_body.clone();
+        if let Some(body) = req_body_opt.take() {
+            match drain_body_for_trace(body, true).await {
+                Ok((sz, bd)) => {
+                    trace.req_size = sz;
+                    if recording {
+                        trace.req_body = bd.clone();
+                    }
+                    offline_req_body = bd;
+                }
+                Err(err) => {
+                    return finalize_and_respond(
+                        &state,
+                        recording,
+                        &mut trace,
+                        400,
+                        json_headers(),
+                        serde_json::to_vec(&json!({ "error": err })).unwrap_or_default(),
+                        false,
+                        None,
+                        Some(err),
+                    );
+                }
+            }
+        }
+        if let Some((status, val)) = serve_offline_fallback(
+            &state,
+            &method,
+            &path,
+            directory.as_deref(),
+            offline_req_body.as_deref(),
+        ) {
             let mut headers = json_headers();
             headers.insert("x-oc-proxy-mocked".into(), "offline".into());
             return finalize_and_respond(
                 &state,
+                recording,
                 &mut trace,
                 status,
                 headers,
@@ -354,6 +666,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
         }
         return finalize_and_respond(
             &state,
+            recording,
             &mut trace,
             404,
             json_headers(),
@@ -364,7 +677,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
         );
     };
 
-    // 4. Forward to Upstream OpenCode Server
+    // 4. Forward to Upstream OpenCode Server (streaming request/response with bounded tee capture)
     let target_url = match &query {
         Some(q) if !q.is_empty() => format!("{}{}?{}", upstream.trim_end_matches('/'), path, q),
         _ => format!("{}{}", upstream.trim_end_matches('/'), path),
@@ -378,32 +691,154 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
         let lower = k.to_lowercase();
         if matches!(
             lower.as_str(),
-            "host" | "connection" | "keep-alive" | "transfer-encoding" | "content-length" | "accept-encoding"
+            "host"
+                | "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "content-length"
+                | "accept-encoding"
         ) {
             continue;
         }
         builder = builder.header(k.as_str(), v.as_str());
     }
 
-    if let Some(body) = req_body_str {
-        builder = builder.body(body);
-    }
+    let mut req_capture_state: Option<Arc<Mutex<BodyCapture>>> = None;
+    let outgoing_body = if let Some(bp_bytes) = breakpoint_forward_body {
+        if bp_bytes.is_empty() {
+            OutgoingReqBody::Empty
+        } else {
+            OutgoingReqBody::Full(bp_bytes)
+        }
+    } else if let Some(live_body) = req_body_opt.take() {
+        let cap = Arc::new(Mutex::new(BodyCapture::new(recording)));
+        match prepare_streaming_req_body(live_body, Arc::clone(&cap)).await {
+            Ok(out) => {
+                req_capture_state = Some(cap);
+                out
+            }
+            Err(err) => {
+                let (sz, bd) = cap.lock().unwrap().snapshot_size_and_body();
+                trace.req_size = sz;
+                if recording {
+                    trace.req_body = bd;
+                }
+                return finalize_and_respond(
+                    &state,
+                    recording,
+                    &mut trace,
+                    400,
+                    json_headers(),
+                    serde_json::to_vec(&json!({ "error": err })).unwrap_or_default(),
+                    false,
+                    None,
+                    Some(err),
+                );
+            }
+        }
+    } else {
+        OutgoingReqBody::Empty
+    };
+
+    builder = match outgoing_body {
+        OutgoingReqBody::Empty => builder,
+        OutgoingReqBody::Full(b) => builder.body(b),
+        OutgoingReqBody::Streaming(s) => builder.body(s),
+    };
 
     match builder.send().await {
         Ok(res) => {
+            if let Some(ref rc) = req_capture_state {
+                let (sz, bd) = rc.lock().unwrap().snapshot_size_and_body();
+                trace.req_size = sz;
+                if recording {
+                    trace.req_body = bd;
+                }
+            }
+
             let status = res.status().as_u16();
+            let needs_shadow_merge = method == Method::GET
+                && mount_shadow
+                && status == 200
+                && matches!(
+                    path.trim_end_matches('/'),
+                    "/session" | "/session/status" | "/permission" | "/question"
+                )
+                && !state.shadow.read().unwrap().sessions.is_empty();
+            let needs_response_buffer = patch_to_apply.is_some() || needs_shadow_merge;
+
             let mut res_headers = BTreeMap::new();
             for (k, v) in res.headers() {
                 let name = k.as_str().to_lowercase();
-                if matches!(
-                    name.as_str(),
-                    "connection" | "keep-alive" | "transfer-encoding" | "content-length"
-                ) {
+                if matches!(name.as_str(), "connection" | "keep-alive" | "transfer-encoding")
+                    || (needs_response_buffer && name == "content-length")
+                {
                     continue;
                 }
                 if let Ok(val) = v.to_str() {
                     res_headers.insert(name, val.to_string());
                 }
+            }
+
+            if !needs_response_buffer {
+                let extract_session_body =
+                    session_id.is_none() && path.trim_end_matches('/') == "/session";
+                trace.status = Some(status);
+                trace.res_headers = res_headers.clone();
+
+                let finalizer = StreamTraceFinalizer {
+                    state: Arc::clone(&state),
+                    recording,
+                    trace,
+                    req_capture: req_capture_state,
+                    res_capture: BodyCapture::new(recording || extract_session_body),
+                    extract_session_body,
+                    finished: false,
+                };
+                let trace_id_header = finalizer.trace.id.clone();
+
+                let body_stream = futures_util::stream::unfold(
+                    (res.bytes_stream(), finalizer),
+                    |(mut up_stream, mut fin)| async move {
+                        match up_stream.next().await {
+                            Some(Ok(chunk)) => {
+                                fin.res_capture.observe_chunk(&chunk);
+                                Some((Ok::<Bytes, std::io::Error>(chunk), (up_stream, fin)))
+                            }
+                            Some(Err(err)) => {
+                                let msg = format!("upstream stream read error: {err}");
+                                fin.finish(Some(msg));
+                                Some((
+                                    Err(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        err.to_string(),
+                                    )),
+                                    (up_stream, fin),
+                                ))
+                            }
+                            None => {
+                                fin.finish(None);
+                                None
+                            }
+                        }
+                    },
+                );
+
+                let mut resp_builder = Response::builder().status(status);
+                for (k, v) in res_headers {
+                    if let (Ok(hn), Ok(hv)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_str(&v),
+                    ) {
+                        resp_builder = resp_builder.header(hn, hv);
+                    }
+                }
+                if let Ok(hv) = HeaderValue::from_str(&trace_id_header) {
+                    resp_builder = resp_builder.header("x-oc-proxy-trace-id", hv);
+                }
+                return resp_builder
+                    .body(Body::from_stream(body_stream))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
 
             let raw_bytes = match res.bytes().await {
@@ -412,6 +847,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
                     let msg = format!("upstream read error: {err}");
                     return finalize_and_respond(
                         &state,
+                        recording,
                         &mut trace,
                         502,
                         json_headers(),
@@ -428,7 +864,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
             let mut rule_id = None;
 
             // Hybrid Shadow Store merge on GET /session and GET /session/status
-            if method == Method::GET && mount_shadow && status == 200 {
+            if needs_shadow_merge {
                 if let Ok(mut parsed) = serde_json::from_slice::<Value>(&final_bytes) {
                     if merge_shadow_into_upstream(&state, &path, &mut parsed) {
                         if let Ok(encoded) = serde_json::to_vec(&parsed) {
@@ -460,6 +896,7 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
 
             finalize_and_respond(
                 &state,
+                recording,
                 &mut trace,
                 status,
                 res_headers,
@@ -470,9 +907,17 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
             )
         }
         Err(err) => {
+            if let Some(ref rc) = req_capture_state {
+                let (sz, bd) = rc.lock().unwrap().snapshot_size_and_body();
+                trace.req_size = sz;
+                if recording {
+                    trace.req_body = bd;
+                }
+            }
             let msg = format!("upstream connect error: {err}");
             finalize_and_respond(
                 &state,
+                recording,
                 &mut trace,
                 502,
                 json_headers(),
@@ -485,8 +930,10 @@ async fn handle_http_proxy(State(state): State<Arc<AppState>>, req: Request) -> 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_and_respond(
     state: &Arc<AppState>,
+    recording: bool,
     trace: &mut HttpTrace,
     status: u16,
     res_headers: BTreeMap<String, String>,
@@ -501,18 +948,17 @@ fn finalize_and_respond(
     trace.status = Some(status);
     trace.res_headers = res_headers.clone();
     trace.res_size = body_bytes.len();
-    trace.res_body = if body_bytes.is_empty() {
-        None
+    trace.res_body = if recording {
+        full_utf8_capture(&body_bytes)
     } else {
-        let cap = body_bytes.len().min(MAX_CAPTURE_BODY_BYTES);
-        Some(String::from_utf8_lossy(&body_bytes[..cap]).into_owned())
+        None
     };
     trace.mocked = mocked;
     trace.mock_rule_id = mock_rule_id;
     trace.upstream_error = upstream_error;
     trace.pending = false;
 
-    if state.is_recording() {
+    if recording {
         let _ = state.storage.complete_http_trace(trace);
         state.broadcast(ControlWsEvent::HttpCompleted {
             trace: trace_to_summary(trace),

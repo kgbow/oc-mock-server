@@ -13,7 +13,7 @@ It sits transparently between OpenCode clients (Web App, Desktop App, or `openco
 A single Rust process binds two separate ports to eliminate route, CORS, and recursion conflicts:
 
 1. **Proxy Plane (default `127.0.0.1:4097`)** — Presents an OpenCode-compatible server surface to clients:
-   - **HTTP Reverse Proxy**: Streaming request/response passthrough with two-phase trace reporting (`Pending` -> `Completed`), CORS/Basic Auth forwarding, body tee capture (bounded), and `directory` / `workspace` / `sessionID` semantic extraction.
+   - **HTTP Reverse Proxy**: Streaming request/response passthrough with two-phase trace reporting (`Pending` -> `Completed`), CORS/Basic Auth forwarding, full body tee capture, and `directory` / `workspace` / `sessionID` semantic extraction.
    - **Mock, Patch & Breakpoint Engine**: Evaluates priority-ordered rules matching `method`, `path_pattern` (supporting `:param` and `*`), and optional `directory_filter`:
      - `direct`: Immediate local response with optional artificial latency (`delay_ms`).
      - `patch`: Forward to upstream, then merge/patch JSON response before returning.

@@ -532,18 +532,7 @@ async fn async_main() -> Result<()> {
 
         Commands::State { session_id, at_seq } => {
             let storage = Storage::open(&cli.db)?;
-            let events = storage.list_sse_events(
-                Some(&session_id),
-                None,
-                None,
-                None,
-                at_seq,
-                true,
-                None,
-                5000,
-                false,
-            )?;
-            let store = ShadowStore::reconstruct_from_records(&events, at_seq);
+            let store = storage.reconstruct_session_state(&session_id, at_seq)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&store.snapshot_json(Some(&session_id)))?

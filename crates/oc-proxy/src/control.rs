@@ -1,7 +1,7 @@
 use crate::replay;
 use crate::state::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -72,6 +72,7 @@ pub fn build_control_router(state: Arc<AppState>) -> Router {
         .route("/api/llm/mutate", post(llm_mutate))
         .route("/api/ws", get(handle_ws))
         .fallback(serve_web_ui)
+        .layer(DefaultBodyLimit::disable())
         .layer(cors)
         .with_state(state)
 }
@@ -304,11 +305,10 @@ async fn get_session_state(
     Path(id): Path<String>,
     Query(q): Query<StateAtQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let events = state
+    let store = state
         .storage
-        .list_sse_events(Some(&id), None, None, None, q.at_seq, true, None, 5000, false)
+        .reconstruct_session_state(&id, q.at_seq)
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let store = ShadowStore::reconstruct_from_records(&events, q.at_seq);
     Ok(Json(store.snapshot_json(Some(&id))))
 }
 

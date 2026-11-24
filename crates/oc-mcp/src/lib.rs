@@ -1,5 +1,5 @@
 use anyhow::Result;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -105,6 +105,7 @@ pub fn mcp_http_router(state: Arc<AppState>) -> Router {
                 .post(handle_mcp_post)
                 .delete(handle_mcp_delete),
         )
+        .layer(DefaultBodyLimit::disable())
         .with_state(backend)
 }
 
@@ -538,9 +539,7 @@ async fn call_tool(backend: &McpBackend, name: &str, args: Value) -> Result<Valu
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("missing session_id"))?;
             let at_seq = args.get("at_seq").and_then(Value::as_i64);
-            let events =
-                storage.list_sse_events(Some(sid), None, None, None, at_seq, true, None, 5000, false)?;
-            let store = ShadowStore::reconstruct_from_records(&events, at_seq);
+            let store = storage.reconstruct_session_state(sid, at_seq)?;
             Ok(store.snapshot_json(Some(sid)))
         }
         "create_mock_rule" => {

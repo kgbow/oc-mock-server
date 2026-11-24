@@ -289,3 +289,156 @@ fn fold_events_keeps_non_deltas_intact() {
     let folded = fold_sse_events(records);
     assert_eq!(folded.len(), 2);
 }
+
+#[test]
+fn long_session_over_5000_events_is_not_truncated() {
+    let store = Storage::open_in_memory().unwrap();
+    let ts = now_ms();
+    let sid = "ses_long_6000";
+
+    store
+        .insert_sse_event(
+            ts,
+            SseSource::Upstream,
+            "/repo/long",
+            &json!({
+                "type": "session.created",
+                "properties": {
+                    "info": {
+                        "id": sid,
+                        "directory": "/repo/long",
+                        "title": "Long Streaming Session"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+    store
+        .insert_sse_event(
+            ts + 1,
+            SseSource::Upstream,
+            "/repo/long",
+            &json!({
+                "type": "message.updated",
+                "properties": {
+                    "info": { "id": "msg_long", "sessionID": sid, "role": "assistant" }
+                }
+            }),
+        )
+        .unwrap();
+    store
+        .insert_sse_event(
+            ts + 2,
+            SseSource::Upstream,
+            "/repo/long",
+            &json!({
+                "type": "message.part.updated",
+                "properties": {
+                    "part": {
+                        "id": "prt_long",
+                        "sessionID": sid,
+                        "messageID": "msg_long",
+                        "type": "text",
+                        "text": ""
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+    let delta_count = 5500usize;
+    let mut seq_at_5200 = 0i64;
+    for i in 1..=delta_count {
+        let rec = store
+            .insert_sse_event(
+                ts + 10 + i as i64,
+                SseSource::Upstream,
+                "/repo/long",
+                &json!({
+                    "type": "message.part.delta",
+                    "properties": {
+                        "sessionID": sid,
+                        "messageID": "msg_long",
+                        "partID": "prt_long",
+                        "field": "text",
+                        "delta": "x"
+                    }
+                }),
+            )
+            .unwrap();
+        if i == 5200 {
+            seq_at_5200 = rec.seq;
+        }
+    }
+
+    // Emit tail events well past the 5,000-row single-page query ceiling
+    store
+        .insert_sse_event(
+            ts + 10_000,
+            SseSource::Upstream,
+            "/repo/long",
+            &json!({
+                "type": "todo.updated",
+                "properties": {
+                    "sessionID": sid,
+                    "todos": [{ "id": "td_tail", "content": "Tail todo after 5500 deltas" }]
+                }
+            }),
+        )
+        .unwrap();
+    store
+        .insert_sse_event(
+            ts + 10_001,
+            SseSource::Upstream,
+            "/repo/long",
+            &json!({
+                "type": "session.error",
+                "properties": {
+                    "sessionID": sid,
+                    "error": "late_error_past_5000"
+                }
+            }),
+        )
+        .unwrap();
+
+    // 1. Generic query no longer clamps explicit limits at 5,000
+    let all_via_limit = store
+        .list_sse_events(Some(sid), None, None, None, None, true, None, 99999, false)
+        .unwrap();
+    assert_eq!(all_via_limit.len(), 3 + delta_count + 2);
+
+    // 2. Tape extraction includes all 5,505 session events without silent truncation
+    let tape = store
+        .extract_tape_from_session(sid, Some("Full Long Tape".into()))
+        .unwrap();
+    assert_eq!(tape.events.len(), 3 + delta_count + 2);
+
+    // 3. Point-in-time state reconstruction works accurately beyond 5,000 events
+    let mid_state = store
+        .reconstruct_session_state(sid, Some(seq_at_5200))
+        .unwrap();
+    let mid_msgs = mid_state.messages_with_parts(sid);
+    assert_eq!(
+        mid_msgs[0]["parts"][0]["text"].as_str().unwrap().len(),
+        5200
+    );
+    assert!(mid_state.todos_for(sid).is_empty());
+
+    let full_state = store.reconstruct_session_state(sid, None).unwrap();
+    let full_msgs = full_state.messages_with_parts(sid);
+    assert_eq!(
+        full_msgs[0]["parts"][0]["text"].as_str().unwrap().len(),
+        delta_count
+    );
+    assert_eq!(full_state.todos_for(sid).len(), 1);
+
+    // 4. Timeline delta-folding and anomaly detection also see events past 5,000
+    let timeline = store.get_session_timeline(sid, true, false, 500).unwrap();
+    assert!(timeline.iter().any(|item| matches!(
+        item,
+        TimelineItem::Sse { event, .. } if event.event_type == "todo.updated"
+    )));
+
+    let anomalies = find_anomalies(&store, &AnomalyOptions::default()).unwrap();
+    assert!(anomalies.iter().any(|a| a.kind == "sse.session_error"));
+}

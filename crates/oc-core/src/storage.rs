@@ -6,8 +6,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-const MAX_BODY_INDEX_CHARS: usize = 64 * 1024;
-
 #[derive(Clone)]
 pub struct Storage {
     conn: Arc<Mutex<Connection>>,
@@ -164,6 +162,7 @@ impl Storage {
 
     pub fn complete_http_trace(&self, trace: &HttpTrace) -> Result<()> {
         let conn = self.conn.lock().unwrap();
+        let req_headers = serde_json::to_string(&trace.req_headers)?;
         let res_headers = serde_json::to_string(&trace.res_headers)?;
         conn.execute(
             r#"UPDATE http_traces SET
@@ -171,12 +170,15 @@ impl Storage {
                 duration_ms = ?3,
                 session_id = COALESCE(?4, session_id),
                 status = ?5,
-                res_headers = ?6,
-                res_body = ?7,
-                res_size = ?8,
-                mocked = ?9,
-                mock_rule_id = ?10,
-                upstream_error = ?11,
+                req_headers = ?6,
+                req_body = ?7,
+                req_size = ?8,
+                res_headers = ?9,
+                res_body = ?10,
+                res_size = ?11,
+                mocked = ?12,
+                mock_rule_id = ?13,
+                upstream_error = ?14,
                 pending = 0
             WHERE id = ?1"#,
             params![
@@ -185,6 +187,9 @@ impl Storage {
                 trace.duration_ms,
                 trace.session_id,
                 trace.status.map(i64::from),
+                req_headers,
+                trace.req_body,
+                trace.req_size as i64,
                 res_headers,
                 trace.res_body,
                 trace.res_size as i64,
@@ -207,11 +212,11 @@ impl Storage {
             content.push('\n');
         }
         if let Some(rb) = &trace.req_body {
-            content.push_str(&truncate_str(rb, MAX_BODY_INDEX_CHARS));
+            content.push_str(rb);
             content.push('\n');
         }
         if let Some(sb) = &trace.res_body {
-            content.push_str(&truncate_str(sb, MAX_BODY_INDEX_CHARS));
+            content.push_str(sb);
         }
         if let Some(err) = &trace.upstream_error {
             content.push('\n');
@@ -274,7 +279,7 @@ impl Storage {
                     ts,
                     session_id.as_deref().unwrap_or(""),
                     meta,
-                    truncate_str(&payload_json, MAX_BODY_INDEX_CHARS),
+                    payload_json,
                 ],
             );
         }
@@ -301,6 +306,35 @@ impl Storage {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<HttpTraceSummary>> {
+        self.query_http_traces(
+            session_id,
+            method,
+            status_min,
+            exclude_session_id,
+            Some(limit.max(1)),
+            offset,
+        )
+    }
+
+    pub fn list_all_http_traces(
+        &self,
+        session_id: Option<&str>,
+        method: Option<&str>,
+        status_min: Option<u16>,
+        exclude_session_id: Option<&str>,
+    ) -> Result<Vec<HttpTraceSummary>> {
+        self.query_http_traces(session_id, method, status_min, exclude_session_id, None, 0)
+    }
+
+    fn query_http_traces(
+        &self,
+        session_id: Option<&str>,
+        method: Option<&str>,
+        status_min: Option<u16>,
+        exclude_session_id: Option<&str>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<HttpTraceSummary>> {
         let conn = self.conn.lock().unwrap();
         let mut sql = String::from(
             r#"SELECT id, started_at, duration_ms, method, path, query, directory, session_id,
@@ -324,9 +358,12 @@ impl Storage {
             sql.push_str(" AND status >= ?");
             dyn_params.push((smin as i64).into());
         }
-        sql.push_str(" ORDER BY started_at DESC LIMIT ? OFFSET ?");
-        dyn_params.push((limit.clamp(1, 1000) as i64).into());
-        dyn_params.push((offset as i64).into());
+        sql.push_str(" ORDER BY started_at DESC");
+        if let Some(lim) = limit {
+            sql.push_str(" LIMIT ? OFFSET ?");
+            dyn_params.push((lim as i64).into());
+            dyn_params.push((offset as i64).into());
+        }
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(dyn_params), |row| {
@@ -404,6 +441,55 @@ impl Storage {
         limit: usize,
         descending: bool,
     ) -> Result<Vec<SseRecord>> {
+        self.query_sse_events(
+            session_id,
+            event_type,
+            directory,
+            from_seq,
+            to_seq,
+            exclude_heartbeat,
+            exclude_session_id,
+            Some(limit.max(1)),
+            descending,
+        )
+    }
+
+    /// Fetch all matching SSE events in ascending `seq` order without the single-page query cap.
+    pub fn list_all_sse_events(
+        &self,
+        session_id: Option<&str>,
+        event_type: Option<&str>,
+        directory: Option<&str>,
+        from_seq: Option<i64>,
+        to_seq: Option<i64>,
+        exclude_heartbeat: bool,
+        exclude_session_id: Option<&str>,
+    ) -> Result<Vec<SseRecord>> {
+        self.query_sse_events(
+            session_id,
+            event_type,
+            directory,
+            from_seq,
+            to_seq,
+            exclude_heartbeat,
+            exclude_session_id,
+            None,
+            false,
+        )
+    }
+
+    fn query_sse_events(
+        &self,
+        session_id: Option<&str>,
+        event_type: Option<&str>,
+        directory: Option<&str>,
+        from_seq: Option<i64>,
+        to_seq: Option<i64>,
+        exclude_heartbeat: bool,
+        exclude_session_id: Option<&str>,
+        limit: Option<usize>,
+        descending: bool,
+    ) -> Result<Vec<SseRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut sql = String::from(
             r#"SELECT seq, ts, source, directory, event_type, session_id, message_id, part_id, payload_json
@@ -438,11 +524,14 @@ impl Storage {
             sql.push_str(" AND event_type != 'server.heartbeat'");
         }
         if descending {
-            sql.push_str(" ORDER BY seq DESC LIMIT ?");
+            sql.push_str(" ORDER BY seq DESC");
         } else {
-            sql.push_str(" ORDER BY seq ASC LIMIT ?");
+            sql.push_str(" ORDER BY seq ASC");
         }
-        dyn_params.push((limit.clamp(1, 5000) as i64).into());
+        if let Some(lim) = limit {
+            sql.push_str(" LIMIT ?");
+            dyn_params.push((lim as i64).into());
+        }
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(dyn_params), |row| {
@@ -462,6 +551,46 @@ impl Storage {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Reconstruct client ShadowStore state for `session_id` up to `at_seq` (inclusive) by
+    /// streaming all matching SSE events in sequence order without any page-size truncation.
+    pub fn reconstruct_session_state(
+        &self,
+        session_id: &str,
+        at_seq: Option<i64>,
+    ) -> Result<crate::shadow::ShadowStore> {
+        let conn = self.conn.lock().unwrap();
+        let mut sql = String::from(
+            r#"SELECT directory, payload_json
+               FROM sse_events
+               WHERE session_id = ? AND event_type != 'server.heartbeat'"#,
+        );
+        let mut dyn_params: Vec<rusqlite::types::Value> = vec![session_id.to_string().into()];
+        if let Some(ts) = at_seq {
+            sql.push_str(" AND seq <= ?");
+            dyn_params.push(ts.into());
+        }
+        sql.push_str(" ORDER BY seq ASC");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(dyn_params), |row| {
+            let dir: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            Ok((dir, raw))
+        })?;
+
+        let mut store = crate::shadow::ShadowStore::new(String::new());
+        for row in rows {
+            let (dir, raw) = row?;
+            if store.directory.is_empty() && !dir.is_empty() && dir != "global" {
+                store.directory = dir;
+            }
+            if let Ok(payload) = serde_json::from_str::<Value>(&raw) {
+                store.apply_event(&payload);
+            }
+        }
+        Ok(store)
     }
 
     pub fn list_sessions(
@@ -629,9 +758,9 @@ impl Storage {
         limit: usize,
     ) -> Result<Vec<TimelineItem>> {
         let mut traces =
-            self.list_http_traces(Some(session_id), None, None, None, 1000, 0)?;
+            self.list_all_http_traces(Some(session_id), None, None, None)?;
         traces.reverse();
-        let events = self.list_sse_events(
+        let events = self.list_all_sse_events(
             Some(session_id),
             None,
             None,
@@ -639,8 +768,6 @@ impl Storage {
             None,
             !include_heartbeat,
             None,
-            5000,
-            false,
         )?;
 
         let mut items: Vec<TimelineItem> = Vec::new();
@@ -705,7 +832,7 @@ impl Storage {
             dyn_params.push(k.to_string().into());
         }
         sql.push_str(" ORDER BY ts DESC LIMIT ?");
-        dyn_params.push((limit.clamp(1, 200) as i64).into());
+        dyn_params.push((limit.max(1) as i64).into());
 
         let mut stmt = conn.prepare(&sql)?;
         let raw_hits: Vec<(String, String, i64, String, String)> = stmt
@@ -968,7 +1095,7 @@ impl Storage {
         session_id: &str,
         name: Option<String>,
     ) -> Result<Tape> {
-        let events = self.list_sse_events(
+        let events = self.list_all_sse_events(
             Some(session_id),
             None,
             None,
@@ -976,8 +1103,6 @@ impl Storage {
             None,
             true,
             None,
-            5000,
-            false,
         )?;
         let first_ts = events.first().map(|e| e.ts).unwrap_or_else(now_ms);
         let directory = events
@@ -988,18 +1113,22 @@ impl Storage {
 
         let mut snapshot = TapeSnapshot::default();
         // Pull initial session info from earliest GET /session/:id trace if available
-        let traces = self.list_http_traces(Some(session_id), Some("GET"), None, None, 20, 0)?;
-        for t in traces.into_iter().rev() {
-            if t.path == format!("/session/{session_id}") {
-                if let Some(full) = self.get_http_trace(&t.id)? {
-                    if let Some(body) = full.res_body {
-                        if let Ok(val) = serde_json::from_str::<Value>(&body) {
-                            if val.get("id").is_some() {
-                                snapshot.sessions = vec![val];
-                                break;
-                            }
-                        }
-                    }
+        let target_path = format!("/session/{session_id}");
+        let earliest_body: Option<String> = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                r#"SELECT res_body FROM http_traces
+                   WHERE session_id = ?1 AND UPPER(method) = 'GET' AND path = ?2 AND res_body IS NOT NULL
+                   ORDER BY started_at ASC LIMIT 1"#,
+                params![session_id, target_path],
+                |row| row.get(0),
+            )
+            .optional()?
+        };
+        if let Some(body) = earliest_body {
+            if let Ok(val) = serde_json::from_str::<Value>(&body) {
+                if val.get("id").is_some() {
+                    snapshot.sessions = vec![val];
                 }
             }
         }

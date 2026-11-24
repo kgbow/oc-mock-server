@@ -1,5 +1,7 @@
+use axum::body::Bytes;
+use axum::extract::DefaultBodyLimit;
 use axum::response::sse::{Event as SseEvent, Sse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use oc_core::*;
@@ -36,6 +38,11 @@ async fn spawn_fake_upstream() -> String {
             "/doc",
             get(|| async { Json(oc_core::openapi::builtin_opencode_openapi()) }),
         )
+        .route(
+            "/echo-large",
+            post(|body: Bytes| async move { body }),
+        )
+        .layer(DefaultBodyLimit::disable())
         .route(
             "/global/event",
             get(|| async {
@@ -413,4 +420,71 @@ async fn end_to_end_proxy_mock_breakpoint_replay_and_mcp() {
     assert_eq!(state_res["result"]["isError"], false);
     let state_txt = state_res["result"]["content"][0]["text"].as_str().unwrap();
     assert!(state_txt.contains("Found the root cause!"));
+
+    // 7. Streaming HTTP bodies > 2 MiB succeed (no 413) and capture the FULL body without truncation
+    let large_len = 3 * 1024 * 1024 + 17; // > 2 MiB
+    let mut large_payload = vec![b'A'; large_len];
+    large_payload[large_len - 8..].copy_from_slice(b"TAILMARK");
+
+    let echo_res = client
+        .post(format!("{proxy_base}/echo-large"))
+        .body(large_payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(echo_res.status(), 200);
+    let trace_id = echo_res
+        .headers()
+        .get("x-oc-proxy-trace-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let echoed_bytes = echo_res.bytes().await.unwrap();
+    assert_eq!(echoed_bytes.len(), large_len);
+    assert_eq!(&echoed_bytes[..], &large_payload[..]);
+
+    let stored_trace: HttpTrace = client
+        .get(format!("{control_base}/api/http/{trace_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stored_trace.req_size, large_len);
+    assert_eq!(stored_trace.res_size, large_len);
+    assert_eq!(stored_trace.req_body.as_ref().unwrap().len(), large_len);
+    assert_eq!(stored_trace.res_body.as_ref().unwrap().len(), large_len);
+    assert!(stored_trace.req_body.as_ref().unwrap().ends_with("TAILMARK"));
+    assert!(stored_trace.res_body.as_ref().unwrap().ends_with("TAILMARK"));
+
+    // Disable recording and verify > 2 MiB request still streams cleanly without recording a trace
+    client
+        .post(format!("{control_base}/api/recording"))
+        .json(&json!({ "enabled": false }))
+        .send()
+        .await
+        .unwrap();
+    let echo_unrecorded = client
+        .post(format!("{proxy_base}/echo-large"))
+        .body(large_payload.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(echo_unrecorded.status(), 200);
+    let unrec_id = echo_unrecorded
+        .headers()
+        .get("x-oc-proxy-trace-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(echo_unrecorded.bytes().await.unwrap().len(), large_len);
+    let missing_trace = client
+        .get(format!("{control_base}/api/http/{unrec_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_trace.status(), 404);
 }

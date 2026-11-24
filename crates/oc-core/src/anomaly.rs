@@ -28,13 +28,11 @@ pub fn find_anomalies(storage: &Storage, opts: &AnomalyOptions) -> Result<Vec<An
     let mut anomalies = Vec::new();
 
     // 1. HTTP 4xx/5xx, upstream transport errors, and slow requests
-    let traces = storage.list_http_traces(
+    let traces = storage.list_all_http_traces(
         opts.session_id.as_deref(),
         None,
         None,
         opts.exclude_session_id.as_deref(),
-        1000,
-        0,
     )?;
 
     for t in &traces {
@@ -89,7 +87,7 @@ pub fn find_anomalies(storage: &Storage, opts: &AnomalyOptions) -> Result<Vec<An
     }
 
     // 2. SSE anomalies: session.error, orphan deltas, reconnect storms, stuck prompts, dir mismatches
-    let events = storage.list_sse_events(
+    let events = storage.list_all_sse_events(
         opts.session_id.as_deref(),
         None,
         None,
@@ -97,8 +95,6 @@ pub fn find_anomalies(storage: &Storage, opts: &AnomalyOptions) -> Result<Vec<An
         None,
         true,
         opts.exclude_session_id.as_deref(),
-        5000,
-        false,
     )?;
 
     let mut seen_parts: HashSet<(String, String)> = HashSet::new();
